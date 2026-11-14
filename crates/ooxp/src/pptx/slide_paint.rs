@@ -1206,6 +1206,10 @@ fn fill_ellipse_device(rgb: &mut [u8], width: u32, height: u32, oval: &Oval) -> 
     let Some(stroke) = oval.stroke else {
         return true;
     };
+    // 半透明填充若先铺整圆描边，圆心会变成叠在描边色上的平色。
+    if oval.fill.on && oval.fill.alpha < 255 {
+        return paint_translucent_stroked_ellipse(rgb, width, height, oval, stroke);
+    }
     let Some((x, y, w, h)) = ellipse_device_box(oval, true) else {
         return true;
     };
@@ -1229,6 +1233,93 @@ fn fill_ellipse_device(rgb: &mut [u8], width: u32, height: u32, oval: &Oval) -> 
         oval.fill.color,
         oval.fill.alpha,
     )
+}
+
+/// 半透明填充叠在已画像素上，描边只取外接矩形外侧那一圈的覆盖差。
+fn paint_translucent_stroked_ellipse(
+    rgb: &mut [u8],
+    width: u32,
+    height: u32,
+    oval: &Oval,
+    stroke: [u8; 3],
+) -> bool {
+    let Some((ox, oy, ow, oh)) = ellipse_device_box(oval, true) else {
+        return true;
+    };
+    let Some((ix, iy, iw, ih)) = ellipse_device_box(oval, false) else {
+        return true;
+    };
+    let Some(outer) = ellipse_coverage(ox, oy, ow, oh) else {
+        return false;
+    };
+    let Some(inner) = ellipse_coverage(ix, iy, iw, ih) else {
+        return false;
+    };
+    for ly in 0..outer.h {
+        for lx in 0..outer.w {
+            let px = outer.x + lx;
+            let py = outer.y + ly;
+            let grown = outer.cov[ly as usize * outer.w as usize + lx as usize];
+            let fill_cov = cover_at(&inner, px, py);
+            if fill_cov > 0 {
+                let cov = ((u16::from(fill_cov) * u16::from(oval.fill.alpha) + 127) / 255) as u8;
+                blend(rgb, width, height, px, py, oval.fill.color, cov);
+            }
+            let stroke_cov = grown.saturating_sub(fill_cov);
+            if stroke_cov > 0 {
+                blend(rgb, width, height, px, py, stroke, stroke_cov);
+            }
+        }
+    }
+    true
+}
+
+struct EllipseCover {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    cov: Vec<u8>,
+}
+
+/// 记下 GDI+ 椭圆的页面覆盖。外扩 2 像素，把抗锯齿边收进来。
+fn ellipse_coverage(x: i32, y: i32, w: i32, h: i32) -> Option<EllipseCover> {
+    const PAD: i32 = 2;
+    let origin_x = x - PAD;
+    let origin_y = y - PAD;
+    let bw = w + PAD * 2;
+    let bh = h + PAD * 2;
+    if bw <= 0 || bh <= 0 {
+        return None;
+    }
+    let mut cov = vec![0u8; bw as usize * bh as usize];
+    let ok = fill_device_ellipse(x, y, w, h, |px, py, sample| {
+        let lx = px - origin_x;
+        let ly = py - origin_y;
+        if lx < 0 || ly < 0 || lx >= bw || ly >= bh {
+            return;
+        }
+        let i = ly as usize * bw as usize + lx as usize;
+        if sample > cov[i] {
+            cov[i] = sample;
+        }
+    });
+    ok.then_some(EllipseCover {
+        x: origin_x,
+        y: origin_y,
+        w: bw,
+        h: bh,
+        cov,
+    })
+}
+
+fn cover_at(map: &EllipseCover, px: i32, py: i32) -> u8 {
+    let lx = px - map.x;
+    let ly = py - map.y;
+    if lx < 0 || ly < 0 || lx >= map.w || ly >= map.h {
+        return 0;
+    }
+    map.cov[ly as usize * map.w as usize + lx as usize]
 }
 
 fn fill_ellipse_ramp(rgb: &mut [u8], width: u32, height: u32, oval: &Oval) {
@@ -2102,6 +2193,39 @@ mod tests {
         assert!(!header_is_bold_light(
             &crate::xml::parse(other.as_bytes()).unwrap().root
         ));
+    }
+
+    #[test]
+    fn translucent_ellipse_composites_over_the_page() {
+        let mut rgb = vec![0u8; 80 * 80 * 3];
+        for px in rgb.chunks_mut(3) {
+            px.copy_from_slice(&[25, 100, 156]);
+        }
+        fill_ellipse(
+            &mut rgb,
+            80,
+            80,
+            &Oval {
+                x: 10.0,
+                y: 10.0,
+                w: 40.0,
+                h: 40.0,
+                fill: RgbaFill {
+                    color: [255, 255, 255],
+                    alpha: 26,
+                    on: true,
+                },
+                stroke: Some([46, 117, 182]),
+                stroke_f: 1.333,
+            },
+        );
+        let at = |x: usize, y: usize| {
+            let i = (y * 80 + x) * 3;
+            [rgb[i], rgb[i + 1], rgb[i + 2]]
+        };
+        let center = at(30, 30);
+        assert_eq!(center, [48, 116, 166], "圆心应叠在页底上 {center:?}");
+        assert_eq!(at(1, 1), [25, 100, 156]);
     }
 
     #[test]
