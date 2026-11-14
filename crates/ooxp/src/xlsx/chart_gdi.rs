@@ -207,6 +207,91 @@ mod win {
             text.chars().map(|ch| self.advance(ch)).sum()
         }
 
+        /// GDI+ 默认排版宽度。比字形前进宽度多出防裁切的边，幻灯片图例用它留空。
+        pub fn layout_width(&self, text: &str) -> f64 {
+            self.measure_layout(text)
+                .unwrap_or_else(|| self.width(text))
+        }
+
+        fn measure_layout(&self, text: &str) -> Option<f64> {
+            if text.is_empty() || gdiplus_token().is_none() {
+                return None;
+            }
+            let chars: Vec<u16> = text.encode_utf16().collect();
+            let mut name: Vec<u16> = self.name.encode_utf16().collect();
+            name.push(0);
+            unsafe {
+                let mut pixels = [255u8; 4];
+                let mut bitmap = std::ptr::null_mut();
+                if GdipCreateBitmapFromScan0(
+                    1,
+                    1,
+                    4,
+                    PIXEL_FORMAT_32BPP_ARGB,
+                    pixels.as_mut_ptr(),
+                    &mut bitmap,
+                ) != 0
+                    || bitmap.is_null()
+                {
+                    return None;
+                }
+                GdipBitmapSetResolution(bitmap, 96.0, 96.0);
+                let mut graphics = std::ptr::null_mut();
+                if GdipGetImageGraphicsContext(bitmap, &mut graphics) != 0 || graphics.is_null() {
+                    GdipDisposeImage(bitmap);
+                    return None;
+                }
+                GdipSetPageUnit(graphics, UNIT_PIXEL);
+                let mut family = std::ptr::null_mut();
+                if GdipCreateFontFamilyFromName(name.as_ptr(), std::ptr::null_mut(), &mut family)
+                    != 0
+                    || family.is_null()
+                {
+                    GdipDeleteGraphics(graphics);
+                    GdipDisposeImage(bitmap);
+                    return None;
+                }
+                let mut font = std::ptr::null_mut();
+                let style = if self.bold { FONT_STYLE_BOLD } else { 0 };
+                if GdipCreateFont(family, self.pt, style, UNIT_POINT, &mut font) != 0
+                    || font.is_null()
+                {
+                    GdipDeleteFontFamily(family);
+                    GdipDeleteGraphics(graphics);
+                    GdipDisposeImage(bitmap);
+                    return None;
+                }
+                let layout = RectF {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 10_000.0,
+                    h: 1_000.0,
+                };
+                let mut bounds = RectF {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 0.0,
+                    h: 0.0,
+                };
+                let status = GdipMeasureString(
+                    graphics,
+                    chars.as_ptr(),
+                    chars.len() as i32,
+                    font,
+                    &layout,
+                    std::ptr::null_mut(),
+                    &mut bounds,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                );
+                GdipDeleteFont(font);
+                GdipDeleteFontFamily(family);
+                GdipDeleteGraphics(graphics);
+                GdipDisposeImage(bitmap);
+                (status == 0 && bounds.w > 0.0).then_some(f64::from(bounds.w))
+            }
+        }
+
         fn advance(&self, ch: char) -> f64 {
             let Some(metrics) = self.metrics(ch) else {
                 return 0.0;
@@ -570,6 +655,17 @@ mod win {
         fn GdipStringFormatGetGenericTypographic(format: *mut *mut c_void) -> i32;
         fn GdipCloneStringFormat(src: *mut c_void, clone: *mut *mut c_void) -> i32;
         fn GdipSetStringFormatFlags(format: *mut c_void, flags: i32) -> i32;
+        fn GdipMeasureString(
+            graphics: *mut c_void,
+            text: *const u16,
+            length: i32,
+            font: *mut c_void,
+            layout: *const RectF,
+            format: *mut c_void,
+            bounds: *mut RectF,
+            codepoints: *mut i32,
+            lines: *mut i32,
+        ) -> i32;
         fn GdipDrawString(
             graphics: *mut c_void,
             text: *const u16,
@@ -585,6 +681,96 @@ mod win {
         fn GdipDeleteFontFamily(family: *mut c_void) -> i32;
         fn GdipDeleteGraphics(graphics: *mut c_void) -> i32;
         fn GdipDisposeImage(image: *mut c_void) -> i32;
+        fn GdipSetSmoothingMode(graphics: *mut c_void, mode: i32) -> i32;
+        fn GdipSetPixelOffsetMode(graphics: *mut c_void, mode: i32) -> i32;
+        fn GdipFillEllipse(
+            graphics: *mut c_void,
+            brush: *mut c_void,
+            x: f32,
+            y: f32,
+            width: f32,
+            height: f32,
+        ) -> i32;
+    }
+
+    const SMOOTHING_ANTIALIAS: i32 = 4;
+    const PIXEL_OFFSET_HALF: i32 = 4;
+
+    /// 用 GDI+ 抗锯齿和半像素偏移，填充设备像素矩形里的椭圆。
+    /// 回调坐标是页面像素，覆盖率从 0 到 255。
+    pub fn fill_device_ellipse(
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        mut blend: impl FnMut(i32, i32, u8),
+    ) -> bool {
+        if w <= 0 || h <= 0 || gdiplus_token().is_none() {
+            return false;
+        }
+        let pad = 2i32;
+        let bw = w + pad * 2;
+        let bh = h + pad * 2;
+        let mut pixels = vec![0xFFFF_FFFFu32; (bw as usize) * (bh as usize)];
+        let drawn = unsafe {
+            let mut bitmap = std::ptr::null_mut();
+            if GdipCreateBitmapFromScan0(
+                bw,
+                bh,
+                bw * 4,
+                PIXEL_FORMAT_32BPP_ARGB,
+                pixels.as_mut_ptr().cast(),
+                &mut bitmap,
+            ) != 0
+                || bitmap.is_null()
+            {
+                return false;
+            }
+            GdipBitmapSetResolution(bitmap, 96.0, 96.0);
+            let mut graphics = std::ptr::null_mut();
+            if GdipGetImageGraphicsContext(bitmap, &mut graphics) != 0 || graphics.is_null() {
+                GdipDisposeImage(bitmap);
+                return false;
+            }
+            GdipSetPageUnit(graphics, UNIT_PIXEL);
+            GdipSetSmoothingMode(graphics, SMOOTHING_ANTIALIAS);
+            GdipSetPixelOffsetMode(graphics, PIXEL_OFFSET_HALF);
+            let mut brush = std::ptr::null_mut();
+            if GdipCreateSolidFill(0xFF00_0000, &mut brush) != 0 || brush.is_null() {
+                GdipDeleteGraphics(graphics);
+                GdipDisposeImage(bitmap);
+                return false;
+            }
+            let status =
+                GdipFillEllipse(graphics, brush, pad as f32, pad as f32, w as f32, h as f32);
+            GdipDeleteBrush(brush);
+            GdipDeleteGraphics(graphics);
+            GdipDisposeImage(bitmap);
+            status == 0
+        };
+        if !drawn {
+            return false;
+        }
+        for py in 0..bh {
+            for px in 0..bw {
+                let row = pixels[py as usize * bw as usize + px as usize];
+                let red = ((row >> 16) & 0xff) as u8;
+                let green = ((row >> 8) & 0xff) as u8;
+                let blue = (row & 0xff) as u8;
+                if red == 255 && green == 255 && blue == 255 {
+                    continue;
+                }
+                let cov = (255 - u16::from(red))
+                    .max(255 - u16::from(green))
+                    .max(255 - u16::from(blue))
+                    .min(255) as u8;
+                if cov == 0 {
+                    continue;
+                }
+                blend(x - pad + px, y - pad + py, cov);
+            }
+        }
+        true
     }
 
     fn gdiplus_token() -> Option<usize> {
@@ -612,6 +798,17 @@ mod win {
     }
 
     #[test]
+    fn slide_legend_layout_is_wider_than_the_glyph_advance() {
+        let face = Face::open(10.0 * 96.0 / 72.0, false).expect("本机应有图表字体");
+        let advance = face.width("2025 年");
+        let layout = face.layout_width("2025 年");
+        assert!(
+            layout > advance + 4.0,
+            "排版宽度应比前进宽度多出留白 layout={layout} advance={advance}"
+        );
+    }
+
+    #[test]
     fn chart_text_uses_dengxian() {
         let face = Face::open(13.0, true).expect("本机应有图表字体");
         let name = face.text_face();
@@ -620,6 +817,54 @@ mod win {
             "实际字体是 {name}"
         );
         assert_eq!(face.width("1400"), 28.0);
+    }
+
+    #[test]
+    fn yahei_and_song_do_not_share_an_em_top() {
+        let px = 36.0 * 96.0 / 72.0;
+        let mut boxes = Vec::new();
+        for (name, text) in [("Microsoft YaHei", "16.9"), ("宋体", "万")] {
+            let face = Face::open_named(px, true, name).expect(name);
+            let mut min_y = i32::MAX;
+            let mut max_y = i32::MIN;
+            face.draw(text, 8.0, 8.0, [0, 0, 0], |_, y, _, cov| {
+                if cov > 30 {
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                }
+            });
+            boxes.push((face.line_height(), face.em_box(), min_y, max_y));
+        }
+        let (yahei_asc, _, yahei_top, yahei_bot) = boxes[0];
+        let (song_asc, _, song_top, song_bot) = boxes[1];
+        assert!(
+            (yahei_asc - song_asc).abs() > 1.0,
+            "两种字体的基线偏移应该不同 yahei={yahei_asc} song={song_asc}"
+        );
+        assert!(
+            song_top < yahei_top,
+            "字顶对齐时宋体墨迹应更高 song={song_top} yahei={yahei_top}"
+        );
+        assert!(
+            (yahei_bot - song_bot).abs() > 4,
+            "同一 top 下两种字体的字底应该分开"
+        );
+    }
+
+    #[test]
+    fn device_ellipse_edge_is_partial() {
+        let mut solid = 0u8;
+        let mut partial = 0;
+        assert!(fill_device_ellipse(10, 20, 74, 74, |x, y, cov| {
+            if (36..=48).contains(&x) && (46..=58).contains(&y) && cov == 255 {
+                solid = cov;
+            }
+            if cov > 0 && cov < 255 {
+                partial += 1;
+            }
+        }));
+        assert_eq!(solid, 255);
+        assert!(partial > 8, "边缘应有过渡，实际 {partial}");
     }
 
     #[test]
@@ -637,7 +882,7 @@ mod win {
 }
 
 #[cfg(windows)]
-pub use win::Face;
+pub use win::{fill_device_ellipse, Face};
 
 #[cfg(not(windows))]
 pub struct Face;
@@ -664,5 +909,14 @@ impl Face {
         0.0
     }
 
+    pub fn layout_width(&self, text: &str) -> f64 {
+        self.width(text)
+    }
+
     pub fn draw(&self, _: &str, _: f64, _: f64, _: [u8; 3], _: impl FnMut(i32, i32, [u8; 3], u8)) {}
+}
+
+#[cfg(not(windows))]
+pub fn fill_device_ellipse(_: i32, _: i32, _: i32, _: i32, _: impl FnMut(i32, i32, u8)) -> bool {
+    false
 }

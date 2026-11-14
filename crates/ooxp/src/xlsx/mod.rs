@@ -66,7 +66,7 @@ pub use picture::export_media;
 pub use request::{parse_ops, parse_scope};
 pub use sparkline::export_sparkline_image;
 
-pub(crate) use chart_gdi::Face;
+pub(crate) use chart_gdi::{fill_device_ellipse, Face};
 
 pub(crate) fn render_clustered_chart(
     root: &crate::xml::Element,
@@ -75,7 +75,14 @@ pub(crate) fn render_clustered_chart(
     theme_xml: Option<&[u8]>,
 ) -> Result<Vec<u8>, crate::error::Error> {
     let accents = chart_paint::theme_accents(theme_xml);
-    chart_paint::render_chart(root, width, height, accents, None)
+    chart_paint::render_chart(
+        root,
+        width,
+        height,
+        accents,
+        None,
+        chart_paint::ChartHost::Slide,
+    )
 }
 
 pub struct ExportedMedia {

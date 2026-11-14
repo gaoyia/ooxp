@@ -11,7 +11,7 @@ use crate::xml::Element;
 use super::picture;
 use super::shape;
 use super::ExportedMedia;
-use crate::xlsx::Face;
+use crate::xlsx::{fill_device_ellipse, Face};
 
 const EMU_PER_INCH: f64 = 914_400.0;
 const DPI: f64 = 96.0;
@@ -211,18 +211,17 @@ fn paint_ellipse(
     let Some(oval) = oval_box(sp_pr)? else {
         return Ok(());
     };
-    fill_ellipse(
+    fill_ellipse(rgb, width, height, &oval);
+    paint_tx(
+        sp,
+        oval.x.round() as i32,
+        oval.y.round() as i32,
+        oval.w.round() as i32,
+        oval.h.round() as i32,
         rgb,
         width,
         height,
-        oval.x,
-        oval.y,
-        oval.w,
-        oval.h,
-        oval.fill,
-        oval.stroke,
     );
-    paint_tx(sp, oval.x, oval.y, oval.w, oval.h, rgb, width, height);
     Ok(())
 }
 
@@ -236,6 +235,32 @@ fn paint_round(
     let Some(round) = round_box(sp_pr)? else {
         return Ok(());
     };
+    let inset = round
+        .stroke
+        .map(|_| {
+            stroke_inset(round.radius_f, round.stroke_f)
+                .min(round.w / 2)
+                .min(round.h / 2)
+        })
+        .unwrap_or(0);
+    if let Some(color) = round.stroke {
+        if inset > 0 {
+            paint_round_corners(
+                rgb,
+                width,
+                height,
+                round.x,
+                round.y,
+                round.edge_r,
+                round.edge_b,
+                inset,
+                round.radius_f,
+                round.stroke_f,
+                round.fill,
+                color,
+            );
+        }
+    }
     fill_round(
         rgb,
         width,
@@ -244,20 +269,41 @@ fn paint_round(
         round.y,
         round.w,
         round.h,
+        round.edge_r,
+        round.edge_b,
         round.radius,
+        inset,
         round.fill,
     );
+    if let Some(color) = round.stroke {
+        stroke_round(
+            rgb,
+            width,
+            height,
+            round.x,
+            round.y,
+            round.w,
+            round.h,
+            inset,
+            round.stroke_px,
+            round.edge_r,
+            round.edge_b,
+            color,
+        );
+    }
     paint_tx(sp, round.x, round.y, round.w, round.h, rgb, width, height);
     Ok(())
 }
 
 struct Oval {
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
     fill: RgbaFill,
     stroke: Option<[u8; 3]>,
+    /// 描边宽度，单位是像素。12700 EMU 是 1.333。
+    stroke_f: f64,
 }
 
 struct Round {
@@ -267,22 +313,36 @@ struct Round {
     h: i32,
     fill: RgbaFill,
     radius: i32,
+    /// 圆角半径，单位是像素，保留 EMU 的小数。
+    radius_f: f64,
+    stroke: Option<[u8; 3]>,
+    stroke_px: i32,
+    /// 描边宽度，单位是像素，不四舍五入。12700 EMU 是 1.333。
+    stroke_f: f64,
+    edge_r: i32,
+    edge_b: i32,
 }
 
 fn oval_box(sp_pr: &Element) -> Result<Option<Oval>, Error> {
     if rotated(sp_pr) {
         return Err(unsupported());
     }
-    let Some((x, y, w, h)) = px_box(sp_pr) else {
+    let Some(xfrm) = sp_pr.child_by_local("xfrm") else {
         return Ok(None);
     };
+    let (ex, ey, ecx, ecy) = xfrm_box(xfrm);
+    let (w, h) = (emu_f(ecx), emu_f(ecy));
+    if w <= 0.0 || h <= 0.0 || emu_px(ecx) <= 0 || emu_px(ecy) <= 0 {
+        return Ok(None);
+    }
     Ok(Some(Oval {
-        x,
-        y,
+        x: emu_f(ex),
+        y: emu_f(ey),
         w,
         h,
         fill: shape_fill(sp_pr)?,
         stroke: stroke_color(sp_pr)?,
+        stroke_f: stroke_width_f(sp_pr),
     }))
 }
 
@@ -290,9 +350,14 @@ fn round_box(sp_pr: &Element) -> Result<Option<Round>, Error> {
     if rotated(sp_pr) {
         return Err(unsupported());
     }
-    let Some((x, y, w, h)) = px_box(sp_pr) else {
+    let Some(xfrm) = sp_pr.child_by_local("xfrm") else {
         return Ok(None);
     };
+    let (ex, ey, ecx, ecy) = xfrm_box(xfrm);
+    let (x, y, w, h) = (emu_px(ex), emu_px(ey), emu_px(ecx), emu_px(ecy));
+    if w <= 0 || h <= 0 {
+        return Ok(None);
+    }
     Ok(Some(Round {
         x,
         y,
@@ -300,6 +365,12 @@ fn round_box(sp_pr: &Element) -> Result<Option<Round>, Error> {
         h,
         fill: shape_fill(sp_pr)?,
         radius: round_radius(sp_pr, w, h),
+        radius_f: round_radius_f(sp_pr, emu_f(ecx), emu_f(ecy)),
+        stroke: stroke_color(sp_pr)?,
+        stroke_px: stroke_px(sp_pr),
+        stroke_f: stroke_width_f(sp_pr),
+        edge_r: emu_px(ex.saturating_add(ecx)),
+        edge_b: emu_px(ey.saturating_add(ecy)),
     }))
 }
 
@@ -310,16 +381,7 @@ fn rotated(sp_pr: &Element) -> bool {
         .is_some_and(|raw| raw.parse::<i64>().ok().unwrap_or(1) != 0)
 }
 
-fn px_box(sp_pr: &Element) -> Option<(i32, i32, i32, i32)> {
-    let xfrm = sp_pr.child_by_local("xfrm")?;
-    let (x, y, cx, cy) = xfrm_box(xfrm);
-    let (w, h) = (emu_px(cx), emu_px(cy));
-    if w <= 0 || h <= 0 {
-        return None;
-    }
-    Some((emu_px(x), emu_px(y), w, h))
-}
-
+#[derive(Clone, Copy)]
 struct RgbaFill {
     color: [u8; 3],
     alpha: u8,
@@ -350,6 +412,18 @@ fn shape_fill(sp_pr: &Element) -> Result<RgbaFill, Error> {
         alpha: 0,
         on: false,
     })
+}
+
+fn stroke_px(sp_pr: &Element) -> i32 {
+    stroke_width_f(sp_pr).round().max(0.0) as i32
+}
+
+fn stroke_width_f(sp_pr: &Element) -> f64 {
+    let raw = sp_pr
+        .child_by_local("ln")
+        .and_then(|ln| ln.attr("w"))
+        .unwrap_or("9525");
+    raw.parse::<i64>().map(emu_f).unwrap_or(0.0).max(0.0)
 }
 
 fn stroke_color(sp_pr: &Element) -> Result<Option<[u8; 3]>, Error> {
@@ -392,6 +466,10 @@ fn linear_gradient(sp_pr: &Element) -> Option<([u8; 3], [u8; 3], i64)> {
     if stops.len() != 2 {
         return None;
     }
+    let pos = |el: &Element| el.attr("pos").unwrap_or("0").parse::<i64>().ok();
+    if pos(stops[0]) != Some(0) || pos(stops[1]) != Some(100_000) {
+        return None;
+    }
     let c0 = opaque_rgb(stops[0])?;
     let c1 = opaque_rgb(stops[1])?;
     let ang: i64 = grad
@@ -406,8 +484,8 @@ fn linear_gradient(sp_pr: &Element) -> Option<([u8; 3], [u8; 3], i64)> {
     Some((c0, c1, ang))
 }
 
-fn round_radius(sp_pr: &Element, w: i32, h: i32) -> i32 {
-    let adj = sp_pr
+fn round_adj(sp_pr: &Element) -> i64 {
+    sp_pr
         .child_by_local("prstGeom")
         .and_then(|geom| geom.child_by_local("avLst"))
         .and_then(|list| {
@@ -417,9 +495,26 @@ fn round_radius(sp_pr: &Element, w: i32, h: i32) -> i32 {
         .and_then(|gd| gd.attr("fmla"))
         .and_then(|fmla| fmla.strip_prefix("val "))
         .and_then(|raw| raw.parse::<i64>().ok())
-        .unwrap_or(16_667);
+        .unwrap_or(16_667)
+}
+
+fn round_radius(sp_pr: &Element, w: i32, h: i32) -> i32 {
+    let adj = round_adj(sp_pr);
     let ss = i64::from(w.min(h).max(0));
     ((ss * adj) / 100_000).clamp(0, ss / 2) as i32
+}
+
+fn round_radius_f(sp_pr: &Element, w: f64, h: f64) -> f64 {
+    let ss = w.min(h).max(0.0);
+    (ss * round_adj(sp_pr) as f64 / 100_000.0).clamp(0.0, ss / 2.0)
+}
+
+/// 直边实色从这里开始。半径加上线宽后再四舍五入，拐角的过渡留在这一段外面。
+fn stroke_inset(radius_f: f64, stroke_f: f64) -> i32 {
+    if radius_f <= 0.0 || stroke_f <= 0.0 {
+        return 0;
+    }
+    (radius_f + stroke_f).round() as i32
 }
 
 fn paint_frame(
@@ -448,7 +543,7 @@ fn paint_frame(
         return paint_chart(pkg, slide_part, chart, rgb, width, height, x, y, w, h);
     }
     if let Some(tbl) = data.child_by_local("tbl") {
-        paint_table(tbl, rgb, width, height, x, y)?;
+        paint_table(pkg, tbl, rgb, width, height, x, y)?;
         return Ok(());
     }
     Err(unsupported())
@@ -481,6 +576,7 @@ fn paint_chart(
 }
 
 fn paint_table(
+    pkg: &Package,
     tbl: &Element,
     rgb: &mut [u8],
     width: u32,
@@ -497,8 +593,14 @@ fn paint_table(
                 .collect()
         })
         .unwrap_or_default();
+    let fonts = minor_fonts(pkg);
+    let header_style = header_is_bold_light(tbl);
     let mut py = y;
-    for tr in tbl.element_children().filter(|el| el.local_name() == "tr") {
+    for (row_index, tr) in tbl
+        .element_children()
+        .filter(|el| el.local_name() == "tr")
+        .enumerate()
+    {
         let rh = emu_px(tr.attr("h").and_then(|raw| raw.parse().ok()).unwrap_or(0));
         let mut px = x;
         for (i, tc) in tr
@@ -521,17 +623,18 @@ fn paint_table(
             if let Some(color) = fill {
                 fill_rect(rgb, width, height, px, py, cw, rh, color);
             }
-            let ink = fill
-                .map(|color| {
-                    let lum = u16::from(color[0]) + u16::from(color[1]) + u16::from(color[2]);
-                    if lum < 380 {
-                        [255, 255, 255]
-                    } else {
-                        [0x1F, 0x4E, 0x79]
-                    }
-                })
-                .unwrap_or([0, 0, 0]);
-            paint_cell_text(tc, px, py, cw, rh, ink, rgb, width, height);
+            paint_cell_text(
+                tc,
+                &fonts,
+                header_style && row_index == 0,
+                px,
+                py,
+                cw,
+                rh,
+                rgb,
+                width,
+                height,
+            );
             px += cw;
         }
         py += rh;
@@ -539,13 +642,76 @@ fn paint_table(
     Ok(())
 }
 
+/// PowerPoint 中等样式 2 - 强调 1。包里通常只有这个 GUID，样式正文不在部件里。
+const MEDIUM_STYLE_2_ACCENT_1: &str = "{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}";
+
+struct MinorFonts {
+    latin: String,
+    ea: String,
+}
+
+fn minor_fonts(pkg: &Package) -> MinorFonts {
+    let mut fonts = MinorFonts {
+        latin: "Calibri".to_string(),
+        ea: "微软雅黑".to_string(),
+    };
+    let Ok(bytes) = pkg.get("/ppt/theme/theme1.xml") else {
+        return fonts;
+    };
+    let Ok(doc) = crate::xml::parse(bytes) else {
+        return fonts;
+    };
+    let Some(minor) = doc
+        .root
+        .child_by_local("themeElements")
+        .and_then(|el| el.child_by_local("fontScheme"))
+        .and_then(|el| el.child_by_local("minorFont"))
+    else {
+        return fonts;
+    };
+    if let Some(name) = named_typeface(minor, "latin") {
+        fonts.latin = name;
+    }
+    if let Some(name) = named_typeface(minor, "ea") {
+        fonts.ea = name;
+    }
+    fonts
+}
+
+fn named_typeface(parent: &Element, slot: &str) -> Option<String> {
+    let name = parent
+        .child_by_local(slot)?
+        .attr("typeface")?
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+fn header_is_bold_light(tbl: &Element) -> bool {
+    let Some(pr) = tbl.child_by_local("tblPr") else {
+        return false;
+    };
+    let first = matches!(pr.attr("firstRow"), Some("1" | "true"));
+    if !first {
+        return false;
+    }
+    pr.child_by_local("tableStyleId")
+        .map(|el| el.text_content())
+        .is_some_and(|id| id.trim().eq_ignore_ascii_case(MEDIUM_STYLE_2_ACCENT_1))
+}
+
 fn paint_cell_text(
     tc: &Element,
+    fonts: &MinorFonts,
+    header: bool,
     x: i32,
     y: i32,
     w: i32,
     h: i32,
-    color: [u8; 3],
     rgb: &mut [u8],
     width: u32,
     height: u32,
@@ -553,34 +719,49 @@ fn paint_cell_text(
     let Some(tx) = tc.child_by_local("txBody") else {
         return;
     };
-    let text = tx_string(tx);
-    if text.is_empty() {
-        return;
-    }
-    let px = 16.0 * 96.0 / 72.0;
-    let Some(face) = Face::open_named(px, false, "微软雅黑") else {
-        return;
+    let pr = tc.child_by_local("tcPr");
+    let inset = |name: &str, default: i64| {
+        pr.and_then(|el| el.attr(name))
+            .and_then(|raw| raw.parse().ok())
+            .map(emu_px)
+            .unwrap_or_else(|| emu_px(default))
     };
-    let tw = face.width(&text);
-    let left = f64::from(x) + (f64::from(w) - tw) / 2.0;
-    let top = f64::from(y) + (f64::from(h) - face.em_box()) / 2.0;
-    face.draw(&text, left, top, color, |cx, cy, ink, cov| {
-        blend(rgb, width, height, cx, cy, ink, cov);
-    });
-}
-
-fn tx_string(tx: &Element) -> String {
-    let mut out = String::new();
+    let left = x + inset("marL", 91_440);
+    let top = y + inset("marT", 45_720);
+    let right = x + w - inset("marR", 91_440);
+    let bottom = y + h - inset("marB", 45_720);
+    let anchor = pr.and_then(|el| el.attr("anchor")).unwrap_or("t");
+    let mut lines = Vec::new();
     for para in tx.element_children().filter(|el| el.local_name() == "p") {
-        for child in para.element_children() {
-            if child.local_name() == "r" {
-                if let Some(text) = child.child_by_local("t") {
-                    out.push_str(&text.text_content());
-                }
-            }
+        if let Some(line) = cell_line(para, fonts, header) {
+            lines.push(line);
         }
     }
-    out
+    paint_text_block(&lines, left, top, right, bottom, anchor, rgb, width, height);
+}
+
+fn cell_line(para: &Element, fonts: &MinorFonts, header: bool) -> Option<TextLine> {
+    let mut line = para_line(para)?;
+    if line.latin.is_empty() {
+        line.latin.clone_from(&fonts.latin);
+    }
+    if line.ea.is_empty() {
+        line.ea.clone_from(&fonts.ea);
+    }
+    let rpr = run_rpr(para);
+    if header && rpr.and_then(|el| el.attr("b")).is_none() {
+        line.bold = true;
+    }
+    if header && rpr.and_then(|el| el.child_by_local("solidFill")).is_none() {
+        line.color = [255, 255, 255];
+    }
+    Some(line)
+}
+
+fn run_rpr(para: &Element) -> Option<&Element> {
+    para.element_children()
+        .find(|el| el.local_name() == "r" && el.child_by_local("t").is_some())?
+        .child_by_local("rPr")
 }
 
 fn paint_tx(sp: &Element, x: i32, y: i32, w: i32, h: i32, rgb: &mut [u8], width: u32, height: u32) {
@@ -611,40 +792,71 @@ fn paint_tx(sp: &Element, x: i32, y: i32, w: i32, h: i32, rgb: &mut [u8], width:
         };
         lines.push(line);
     }
+    paint_text_block(&lines, left, top, right, bottom, anchor, rgb, width, height);
+}
+
+fn paint_text_block(
+    lines: &[TextLine],
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    anchor: &str,
+    rgb: &mut [u8],
+    width: u32,
+    height: u32,
+) {
     if lines.is_empty() {
         return;
     }
-    let Some(probe) = Face::open_named(lines[0].px, lines[0].bold, &lines[0].font) else {
+    let inner_w = right - left;
+    let inner_h = bottom - top;
+    if inner_w <= 0 || inner_h <= 0 {
         return;
-    };
-    let line_h = probe.em_box();
-    let block = line_h * lines.len() as f64;
+    }
+    let heights: Vec<f64> = lines.iter().map(line_em).collect();
+    let block: f64 = heights.iter().sum();
     let mut cursor_y = match anchor {
         "ctr" => f64::from(top) + (f64::from(inner_h) - block) / 2.0,
         "b" => f64::from(bottom) - block,
         _ => f64::from(top),
     };
-    for line in lines {
-        let Some(face) = Face::open_named(line.px, line.bold, &line.font) else {
-            cursor_y += line_h;
+    for (line, em) in lines.iter().zip(heights) {
+        if em <= 0.0 {
             continue;
-        };
-        let wrapped = wrap_text(&face, &line.text, f64::from(inner_w));
+        }
+        let wrapped = wrap_text(&line.text, f64::from(inner_w), |piece| {
+            piece_width(line, piece)
+        });
         for (index, piece) in wrapped.iter().enumerate() {
             if index > 0 {
-                cursor_y += face.em_box();
+                cursor_y += em;
             }
-            let tw = face.width(piece);
-            let cursor_x = match line.align.as_str() {
+            let tw = piece_width(line, piece);
+            let mut cursor_x = match line.align.as_str() {
                 "ctr" => f64::from(left) + (f64::from(inner_w) - tw) / 2.0,
                 "r" => f64::from(right) - tw,
                 _ => f64::from(left),
             };
-            face.draw(piece, cursor_x, cursor_y, line.color, |cx, cy, ink, cov| {
-                blend(rgb, width, height, cx, cy, ink, cov);
-            });
+            let spans = face_spans(line, piece);
+            let line_ascent = spans
+                .iter()
+                .filter_map(|(name, _)| {
+                    Face::open_named(line.px, line.bold, name).map(|face| face.line_height())
+                })
+                .fold(0.0f64, f64::max);
+            for (name, span) in spans {
+                let Some(face) = Face::open_named(line.px, line.bold, &name) else {
+                    continue;
+                };
+                let draw_top = cursor_y + (line_ascent - face.line_height());
+                face.draw(&span, cursor_x, draw_top, line.color, |cx, cy, ink, cov| {
+                    blend(rgb, width, height, cx, cy, ink, cov);
+                });
+                cursor_x += face.width(&span);
+            }
         }
-        cursor_y += face.em_box();
+        cursor_y += em;
     }
 }
 
@@ -653,7 +865,11 @@ struct TextLine {
     px: f32,
     bold: bool,
     color: [u8; 3],
-    font: String,
+    latin: String,
+    ea: String,
+    cs: String,
+    sym: String,
+    lang: String,
     align: String,
 }
 
@@ -677,23 +893,6 @@ fn para_line(para: &Element) -> Option<TextLine> {
         .and_then(|el| el.child_by_local("solidFill"))
         .and_then(opaque_rgb)
         .unwrap_or([0, 0, 0]);
-    let latin = rpr
-        .and_then(|el| el.child_by_local("latin"))
-        .and_then(|el| el.attr("typeface"))
-        .unwrap_or("");
-    let ea = rpr
-        .and_then(|el| el.child_by_local("ea"))
-        .and_then(|el| el.attr("typeface"))
-        .unwrap_or("");
-    let font = if text.chars().any(|ch| ch > '\u{7f}') && !ea.is_empty() {
-        ea.to_string()
-    } else if !latin.is_empty() {
-        latin.to_string()
-    } else if !ea.is_empty() {
-        ea.to_string()
-    } else {
-        "微软雅黑".to_string()
-    };
     let align = para
         .child_by_local("pPr")
         .and_then(|el| el.attr("algn"))
@@ -704,13 +903,157 @@ fn para_line(para: &Element) -> Option<TextLine> {
         px: sz / 100.0 * 96.0 / 72.0,
         bold,
         color,
-        font,
+        latin: typeface(rpr, "latin"),
+        ea: typeface(rpr, "ea"),
+        cs: typeface(rpr, "cs"),
+        sym: typeface(rpr, "sym"),
+        lang: rpr.and_then(|el| el.attr("lang")).unwrap_or("").to_string(),
         align,
     })
 }
 
-fn wrap_text(face: &Face, text: &str, max_w: f64) -> Vec<String> {
-    if max_w <= 0.0 || face.width(text) <= max_w {
+fn typeface(rpr: Option<&Element>, slot: &str) -> String {
+    rpr.and_then(|el| el.child_by_local(slot))
+        .and_then(|el| el.attr("typeface"))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// ECMA-376 21.1.2.3：每个字符四选一。表里没点名的用东亚字体。
+enum FontSlot {
+    Latin,
+    Ea,
+    Cs,
+    Sym,
+}
+
+fn font_slot(ch: char, lang: &str) -> FontSlot {
+    let n = ch as u32;
+    if (0x2018..=0x201F).contains(&n) && quote_uses_ea(lang) {
+        return FontSlot::Ea;
+    }
+    if (0xF000..=0xF0FF).contains(&n) {
+        return FontSlot::Sym;
+    }
+    if latin_range(n) {
+        return FontSlot::Latin;
+    }
+    if cs_range(n) {
+        return FontSlot::Cs;
+    }
+    FontSlot::Ea
+}
+
+fn quote_uses_ea(lang: &str) -> bool {
+    matches!(
+        lang,
+        "ii-CN" | "ja-JP" | "ko-KR" | "zh-CN" | "zh-HK" | "zh-MO" | "zh-SG" | "zh-TW"
+    )
+}
+
+fn latin_range(n: u32) -> bool {
+    matches!(
+        n,
+        0x0000..=0x007F
+            | 0x0080..=0x00A6
+            | 0x00A9..=0x00AF
+            | 0x00B2..=0x00B3
+            | 0x00B5..=0x00D6
+            | 0x00D8..=0x00F6
+            | 0x00F8..=0x058F
+            | 0x10A0..=0x10FF
+            | 0x1200..=0x137F
+            | 0x13A0..=0x177F
+            | 0x1D00..=0x1D7F
+            | 0x1D400..=0x1D7FF
+            | 0x1E00..=0x1FFF
+            | 0x2000..=0x200B
+            | 0x2010..=0x2029
+            | 0x2030..=0x2046
+            | 0x204A..=0x245F
+            | 0x27C0..=0x2BFF
+            | 0xFB00..=0xFB17
+            | 0xFE50..=0xFE6F
+    )
+}
+
+fn cs_range(n: u32) -> bool {
+    matches!(
+        n,
+        0x0590..=0x074F
+            | 0x0780..=0x07BF
+            | 0x0900..=0x109F
+            | 0x1780..=0x18AF
+            | 0x200C..=0x200F
+            | 0x202A..=0x202F
+            | 0x2670..=0x2671
+            | 0xFB1D..=0xFB4F
+    )
+}
+
+/// 槽上没写字体时，退回同一 run 里已经写明的拉丁或东亚字体。
+fn span_name(line: &TextLine, ch: char) -> String {
+    let picked = match font_slot(ch, &line.lang) {
+        FontSlot::Latin => line.latin.as_str(),
+        FontSlot::Ea => line.ea.as_str(),
+        FontSlot::Cs => line.cs.as_str(),
+        FontSlot::Sym => line.sym.as_str(),
+    };
+    if !picked.is_empty() {
+        picked.to_string()
+    } else if !line.latin.is_empty() {
+        line.latin.clone()
+    } else if !line.ea.is_empty() {
+        line.ea.clone()
+    } else {
+        "微软雅黑".to_string()
+    }
+}
+
+fn face_spans(line: &TextLine, text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for ch in text.chars() {
+        let name = span_name(line, ch);
+        if let Some((prev, buf)) = out.last_mut() {
+            if prev == &name {
+                buf.push(ch);
+                continue;
+            }
+        }
+        out.push((name, ch.to_string()));
+    }
+    out
+}
+
+fn piece_width(line: &TextLine, text: &str) -> f64 {
+    face_spans(line, text)
+        .into_iter()
+        .map(|(name, span)| {
+            Face::open_named(line.px, line.bold, &name)
+                .map(|face| face.width(&span))
+                .unwrap_or(0.0)
+        })
+        .sum()
+}
+
+fn line_em(line: &TextLine) -> f64 {
+    let mut em = 0.0f64;
+    let mut seen: Vec<String> = Vec::new();
+    for ch in line.text.chars() {
+        let name = span_name(line, ch);
+        if seen.iter().any(|item| item == &name) {
+            continue;
+        }
+        seen.push(name.clone());
+        if let Some(face) = Face::open_named(line.px, line.bold, &name) {
+            em = em.max(face.em_box());
+        }
+    }
+    em
+}
+
+fn wrap_text(text: &str, max_w: f64, width: impl Fn(&str) -> f64) -> Vec<String> {
+    if max_w <= 0.0 || width(text) <= max_w {
         return vec![text.to_string()];
     }
     let mut lines = Vec::new();
@@ -718,7 +1061,7 @@ fn wrap_text(face: &Face, text: &str, max_w: f64) -> Vec<String> {
     for ch in text.chars() {
         let mut trial = cur.clone();
         trial.push(ch);
-        if face.width(&trial) > max_w && !cur.is_empty() {
+        if width(&trial) > max_w && !cur.is_empty() {
             lines.push(std::mem::take(&mut cur));
             cur.push(ch);
         } else {
@@ -735,6 +1078,14 @@ fn wrap_text(face: &Face, text: &str, max_w: f64) -> Vec<String> {
     }
 }
 
+/// Office 16.0 两档渐变里，第二档在线性光下的份额。
+/// 黑到白、高 720 的导出在四分之一、一半、四分之三处是 105、186、238。
+/// 份额由这些字节按伽马 2.2 反推，并收成 `w(1 - t) = 1 - w(t)`。
+const GRAD_WEIGHT: [f64; 17] = [
+    0.0, 0.0180, 0.0444, 0.0856, 0.1414, 0.2132, 0.2982, 0.3969, 0.5, 0.6031, 0.7018, 0.7868,
+    0.8586, 0.9144, 0.9556, 0.9820, 1.0,
+];
+
 fn fill_gradient(
     rgb: &mut [u8],
     width: u32,
@@ -748,6 +1099,7 @@ fn fill_gradient(
     ang: i64,
 ) {
     let turn = ang.rem_euclid(FULL_TURN);
+    let quarter = turn / RIGHT_ANGLE;
     for row in 0..h {
         let py = y + row;
         if py < 0 || py >= height as i32 {
@@ -758,17 +1110,17 @@ fn fill_gradient(
             if px < 0 || px >= width as i32 {
                 continue;
             }
-            let quarter = turn / RIGHT_ANGLE;
-            let (num, den) = match quarter {
-                1 => (i64::from(row), i64::from(h - 1)),
-                2 => (i64::from(w - 1 - col), i64::from(w - 1)),
-                3 => (i64::from(h - 1 - row), i64::from(h - 1)),
-                _ => (i64::from(col), i64::from(w - 1)),
+            let along = match quarter {
+                1 => (f64::from(row) + 0.5) / f64::from(h),
+                2 => (f64::from(w - 1 - col) + 0.5) / f64::from(w),
+                3 => (f64::from(h - 1 - row) + 0.5) / f64::from(h),
+                _ => (f64::from(col) + 0.5) / f64::from(w),
             };
+            let share = grad_weight(along);
             let color = [
-                lerp(c0[0], c1[0], num, den),
-                lerp(c0[1], c1[1], num, den),
-                lerp(c0[2], c1[2], num, den),
+                gamma_mix(c0[0], c1[0], share),
+                gamma_mix(c0[1], c1[1], share),
+                gamma_mix(c0[2], c1[2], share),
             ];
             let i = (py as usize * width as usize + px as usize) * 3;
             rgb[i..i + 3].copy_from_slice(&color);
@@ -776,15 +1128,42 @@ fn fill_gradient(
     }
 }
 
-fn lerp(a: u8, b: u8, num: i64, den: i64) -> u8 {
-    if den <= 0 {
-        return a;
-    }
-    let v = i64::from(a) + (i64::from(b) - i64::from(a)) * num / den;
-    v.clamp(0, 255) as u8
+fn grad_weight(t: f64) -> f64 {
+    let x = t.clamp(0.0, 1.0) * 16.0;
+    let i = (x.floor() as usize).min(GRAD_WEIGHT.len() - 2);
+    let f = x - i as f64;
+    GRAD_WEIGHT[i] * (1.0 - f) + GRAD_WEIGHT[i + 1] * f
 }
 
-fn fill_ellipse(
+fn gamma_mix(start: u8, end: u8, share: f64) -> u8 {
+    let from = (f64::from(start) / 255.0).powf(2.2);
+    let to = (f64::from(end) / 255.0).powf(2.2);
+    let mixed = (from + (to - from) * share).clamp(0.0, 1.0);
+    (mixed.powf(1.0 / 2.2) * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// 画椭圆。有描边时外接矩形右和下各加 1 像素，和 PowerPoint 16.0 序号圆一致。
+/// 边缘交给 GDI+ 的抗锯齿。GDI+ 不可用时退回半像素覆盖。
+fn fill_ellipse(rgb: &mut [u8], width: u32, height: u32, oval: &Oval) {
+    if fill_ellipse_device(rgb, width, height, oval) {
+        return;
+    }
+    fill_ellipse_ramp(rgb, width, height, oval);
+}
+
+/// 左上角和右下角四舍五入。有描边时宽高再加 1 像素。
+fn ellipse_device_box(oval: &Oval, grow: bool) -> Option<(i32, i32, i32, i32)> {
+    let left = oval.x.round() as i32;
+    let top = oval.y.round() as i32;
+    let right = (oval.x + oval.w).round() as i32;
+    let bottom = (oval.y + oval.h).round() as i32;
+    let extra = if grow { 1 } else { 0 };
+    let w = right - left + extra;
+    let h = bottom - top + extra;
+    (w > 0 && h > 0).then_some((left, top, w, h))
+}
+
+fn paint_device_ellipse(
     rgb: &mut [u8],
     width: u32,
     height: u32,
@@ -792,41 +1171,155 @@ fn fill_ellipse(
     y: i32,
     w: i32,
     h: i32,
-    fill: RgbaFill,
-    stroke: Option<[u8; 3]>,
-) {
-    let sw = if stroke.is_some() { 1 } else { 0 };
-    for row in 0..h {
-        let py = y + row;
-        for col in 0..w {
-            let px = x + col;
-            if !inside_ellipse(px, py, x, y, w, h) {
-                continue;
-            }
-            let inner = sw > 0
-                && w > sw * 2
-                && h > sw * 2
-                && inside_ellipse(px, py, x + sw, y + sw, w - sw * 2, h - sw * 2);
-            if inner || stroke.is_none() {
-                if fill.on {
-                    blend(rgb, width, height, px, py, fill.color, fill.alpha);
+    color: [u8; 3],
+    alpha: u8,
+) -> bool {
+    fill_device_ellipse(x, y, w, h, |px, py, cov| {
+        let cov = ((u16::from(cov) * u16::from(alpha) + 127) / 255) as u8;
+        blend(rgb, width, height, px, py, color, cov);
+    })
+}
+
+fn fill_ellipse_device(rgb: &mut [u8], width: u32, height: u32, oval: &Oval) -> bool {
+    let same = oval
+        .stroke
+        .is_some_and(|color| oval.fill.on && oval.fill.alpha == 255 && color == oval.fill.color);
+    if same || oval.stroke.is_none() {
+        if !oval.fill.on {
+            return true;
+        }
+        let Some((x, y, w, h)) = ellipse_device_box(oval, oval.stroke.is_some()) else {
+            return true;
+        };
+        return paint_device_ellipse(
+            rgb,
+            width,
+            height,
+            x,
+            y,
+            w,
+            h,
+            oval.fill.color,
+            oval.fill.alpha,
+        );
+    }
+    let Some(stroke) = oval.stroke else {
+        return true;
+    };
+    let Some((x, y, w, h)) = ellipse_device_box(oval, true) else {
+        return true;
+    };
+    if !paint_device_ellipse(rgb, width, height, x, y, w, h, stroke, 255) {
+        return false;
+    }
+    if !oval.fill.on {
+        return true;
+    }
+    let Some((x, y, w, h)) = ellipse_device_box(oval, false) else {
+        return true;
+    };
+    paint_device_ellipse(
+        rgb,
+        width,
+        height,
+        x,
+        y,
+        w,
+        h,
+        oval.fill.color,
+        oval.fill.alpha,
+    )
+}
+
+fn fill_ellipse_ramp(rgb: &mut [u8], width: u32, height: u32, oval: &Oval) {
+    let path_rx = oval.w / 2.0;
+    let path_ry = oval.h / 2.0;
+    if path_rx <= 0.0 || path_ry <= 0.0 {
+        return;
+    }
+    let inset = if oval.stroke.is_some() {
+        oval.stroke_f / 2.0
+    } else {
+        0.0
+    };
+    let fill_rx = (path_rx - inset).max(0.0);
+    let fill_ry = (path_ry - inset).max(0.0);
+    let cx = oval.x + path_rx;
+    let cy = oval.y + path_ry;
+    let same = oval
+        .stroke
+        .is_some_and(|color| oval.fill.on && color == oval.fill.color);
+    let outer_rx = if same { fill_rx } else { path_rx + inset };
+    let outer_ry = if same { fill_ry } else { path_ry + inset };
+    let x0 = (cx - outer_rx - 1.0).floor() as i32;
+    let x1 = (cx + outer_rx + 1.0).ceil() as i32;
+    let y0 = (cy - outer_ry - 1.0).floor() as i32;
+    let y1 = (cy + outer_ry + 1.0).ceil() as i32;
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let fill_cov = if oval.fill.on && fill_rx > 0.0 && fill_ry > 0.0 {
+                ellipse_cover(px, py, cx, cy, fill_rx, fill_ry)
+            } else {
+                0.0
+            };
+            if let Some(color) = oval.stroke {
+                if !same && outer_rx > 0.0 && outer_ry > 0.0 {
+                    let outer = ellipse_cover(px, py, cx, cy, outer_rx, outer_ry);
+                    let stroke_cov = (outer - fill_cov).clamp(0.0, 1.0);
+                    if oval.fill.on && fill_cov > 0.0 {
+                        blend(
+                            rgb,
+                            width,
+                            height,
+                            px,
+                            py,
+                            oval.fill.color,
+                            cover_byte(fill_cov, oval.fill.alpha),
+                        );
+                    }
+                    if stroke_cov > 0.0 {
+                        blend(
+                            rgb,
+                            width,
+                            height,
+                            px,
+                            py,
+                            color,
+                            cover_byte(stroke_cov, 255),
+                        );
+                    }
+                    continue;
                 }
-            } else if let Some(color) = stroke {
-                blend(rgb, width, height, px, py, color, 255);
+            }
+            if fill_cov > 0.0 {
+                blend(
+                    rgb,
+                    width,
+                    height,
+                    px,
+                    py,
+                    oval.fill.color,
+                    cover_byte(fill_cov, oval.fill.alpha),
+                );
             }
         }
     }
 }
 
-fn inside_ellipse(px: i32, py: i32, x: i32, y: i32, w: i32, h: i32) -> bool {
-    if w <= 0 || h <= 0 {
-        return false;
-    }
-    let cx = f64::from(x) + f64::from(w) / 2.0;
-    let cy = f64::from(y) + f64::from(h) / 2.0;
-    let dx = (f64::from(px) + 0.5 - cx) / (f64::from(w) / 2.0);
-    let dy = (f64::from(py) + 0.5 - cy) / (f64::from(h) / 2.0);
-    dx * dx + dy * dy <= 1.0
+/// 像素中心到椭圆边界的距离，向外为正。正圆时就是半径差。
+fn ellipse_signed(px: i32, py: i32, cx: f64, cy: f64, rx: f64, ry: f64) -> f64 {
+    let nx = (f64::from(px) + 0.5 - cx) / rx;
+    let ny = (f64::from(py) + 0.5 - cy) / ry;
+    let unit = (nx * nx + ny * ny).sqrt();
+    (unit - 1.0) * rx.min(ry)
+}
+
+fn ellipse_cover(px: i32, py: i32, cx: f64, cy: f64, rx: f64, ry: f64) -> f64 {
+    (0.5 - ellipse_signed(px, py, cx, cy, rx, ry)).clamp(0.0, 1.0)
+}
+
+fn cover_byte(cover: f64, alpha: u8) -> u8 {
+    (cover * f64::from(alpha)).round().clamp(0.0, 255.0) as u8
 }
 
 fn fill_round(
@@ -837,7 +1330,10 @@ fn fill_round(
     y: i32,
     w: i32,
     h: i32,
+    edge_r: i32,
+    edge_b: i32,
     radius: i32,
+    inset: i32,
     fill: RgbaFill,
 ) {
     if !fill.on {
@@ -847,11 +1343,195 @@ fn fill_round(
         let py = y + row;
         for col in 0..w {
             let px = x + col;
+            if inset > 0 && in_corner_window(px, py, x, y, edge_r, edge_b, inset) {
+                continue;
+            }
             if inside_round(px, py, x, y, w, h, radius) {
                 blend(rgb, width, height, px, py, fill.color, fill.alpha);
             }
         }
     }
+}
+
+fn in_corner_window(
+    px: i32,
+    py: i32,
+    x: i32,
+    y: i32,
+    edge_r: i32,
+    edge_b: i32,
+    inset: i32,
+) -> bool {
+    let on_x = (px >= x - 2 && px < x + inset) || (px >= edge_r - inset && px < edge_r + 3);
+    let on_y = (py >= y - 2 && py < y + inset) || (py >= edge_b - inset && py < edge_b + 3);
+    on_x && on_y
+}
+
+/// 四个拐角的圆弧。圆心落在直边描边像素的中心上，半径是 EMU 圆角。
+/// 覆盖见 `corner_cover`。直边实色不在这里画。
+fn paint_round_corners(
+    rgb: &mut [u8],
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    edge_r: i32,
+    edge_b: i32,
+    inset: i32,
+    radius_f: f64,
+    stroke_f: f64,
+    fill: RgbaFill,
+    stroke: [u8; 3],
+) {
+    if radius_f <= 0.0 || stroke_f <= 0.0 || inset <= 0 {
+        return;
+    }
+    let centers = [
+        (f64::from(x) + 0.5 + radius_f, f64::from(y) + 0.5 + radius_f),
+        (
+            f64::from(edge_r) + 0.5 - radius_f,
+            f64::from(y) + 0.5 + radius_f,
+        ),
+        (
+            f64::from(x) + 0.5 + radius_f,
+            f64::from(edge_b) + 0.5 - radius_f,
+        ),
+        (
+            f64::from(edge_r) + 0.5 - radius_f,
+            f64::from(edge_b) + 0.5 - radius_f,
+        ),
+    ];
+    let windows = [
+        (x - 2, y - 2, x + inset, y + inset),
+        (edge_r - inset, y - 2, edge_r + 3, y + inset),
+        (x - 2, edge_b - inset, x + inset, edge_b + 3),
+        (edge_r - inset, edge_b - inset, edge_r + 3, edge_b + 3),
+    ];
+    for (center, window) in centers.into_iter().zip(windows) {
+        for py in window.1..window.3 {
+            for px in window.0..window.2 {
+                let (fill_cov, stroke_cov) = corner_cover(px, py, center.0, center.1, radius_f);
+                if fill_cov <= 0.0 && stroke_cov <= 0.0 {
+                    continue;
+                }
+                let fill_cov = if fill.on {
+                    fill_cov * f64::from(fill.alpha) / 255.0
+                } else {
+                    0.0
+                };
+                cover_pixel(
+                    rgb, width, height, px, py, fill.color, fill_cov, stroke, stroke_cov,
+                );
+            }
+        }
+    }
+}
+
+/// 拐角描边的覆盖。峰在半径内侧 0.15 像素，向内 0.9 像素、向外 0.65 像素收到 0。
+/// 这是 PowerPoint 16.0 在目录页和经营分析页卡片上的读数，不是实心环。
+/// 填充只占描边没盖住的内侧，避免把页底混进卡片里面。
+fn corner_cover(px: i32, py: i32, cx: f64, cy: f64, radius: f64) -> (f64, f64) {
+    let dx = f64::from(px) + 0.5 - cx;
+    let dy = f64::from(py) + 0.5 - cy;
+    let signed = (dx * dx + dy * dy).sqrt() - radius;
+    let off = signed - CORNER_SHIFT;
+    let half = if off < 0.0 {
+        CORNER_HALF_IN
+    } else {
+        CORNER_HALF_OUT
+    };
+    let stroke = (1.0 - off.abs() / half).clamp(0.0, 1.0);
+    let shape = ((CORNER_FILL_EDGE - signed) / CORNER_FILL_WIDTH).clamp(0.0, 1.0);
+    ((1.0 - stroke) * shape, stroke)
+}
+
+/// 覆盖峰相对圆弧半径的偏移。负值表示峰在半径内侧。
+const CORNER_SHIFT: f64 = -0.15;
+const CORNER_HALF_IN: f64 = 0.90;
+const CORNER_HALF_OUT: f64 = 0.65;
+/// 填充从这里往里铺满。再往外只剩描边和页底。
+const CORNER_FILL_EDGE: f64 = -0.05;
+const CORNER_FILL_WIDTH: f64 = 0.8;
+
+fn cover_pixel(
+    rgb: &mut [u8],
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    fill: [u8; 3],
+    fill_cov: f64,
+    stroke: [u8; 3],
+    stroke_cov: f64,
+) {
+    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+        return;
+    }
+    let stroke_cov = stroke_cov.clamp(0.0, 1.0);
+    let fill_cov = fill_cov.clamp(0.0, 1.0 - stroke_cov);
+    let rest = 1.0 - fill_cov - stroke_cov;
+    if fill_cov + stroke_cov <= 0.0 {
+        return;
+    }
+    let i = (y as usize * width as usize + x as usize) * 3;
+    for k in 0..3 {
+        let v = f64::from(stroke[k]) * stroke_cov
+            + f64::from(fill[k]) * fill_cov
+            + f64::from(rgb[i + k]) * rest;
+        rgb[i + k] = v.round().clamp(0.0, 255.0) as u8;
+    }
+}
+
+fn stroke_round(
+    rgb: &mut [u8],
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    inset: i32,
+    stroke_px: i32,
+    edge_r: i32,
+    edge_b: i32,
+    color: [u8; 3],
+) {
+    if stroke_px <= 0 || w <= 0 || h <= 0 {
+        return;
+    }
+    let sw = stroke_px;
+    let x1 = (x + w).max(edge_r + sw);
+    let y1 = (y + h).max(edge_b + sw);
+    for py in y..y1 {
+        for px in x..x1 {
+            if straight_edge(px, py, x, y, w, h, inset, sw, edge_r, edge_b) {
+                blend(rgb, width, height, px, py, color, 255);
+            }
+        }
+    }
+}
+
+/// 直边落在 EMU 边线四舍五入的那一像素。右和下用起点加长度之后再取整，
+/// 不能把已经取整的宽高再加回去。`inset` 以内是拐角圆弧，这里不画。
+fn straight_edge(
+    px: i32,
+    py: i32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    inset: i32,
+    sw: i32,
+    edge_r: i32,
+    edge_b: i32,
+) -> bool {
+    let on_side = py >= y + inset
+        && py < y + h - inset
+        && ((px >= x && px < x + sw) || (px >= edge_r && px < edge_r + sw));
+    let on_bar = px >= x + inset
+        && px < x + w - inset
+        && ((py >= y && py < y + sw) || (py >= edge_b && py < edge_b + sw));
+    on_side || on_bar
 }
 
 fn inside_round(px: i32, py: i32, x: i32, y: i32, w: i32, h: i32, radius: i32) -> bool {
@@ -1192,8 +1872,12 @@ fn emu_span(emu: i64) -> Result<u32, Error> {
     Ok(px as u32)
 }
 
+fn emu_f(emu: i64) -> f64 {
+    (emu as f64) * DPI / EMU_PER_INCH
+}
+
 fn emu_px(emu: i64) -> i32 {
-    let px = (emu as f64) * DPI / EMU_PER_INCH;
+    let px = emu_f(emu);
     if !px.is_finite() {
         return 0;
     }
@@ -1238,5 +1922,195 @@ mod tests {
         let (color, x, y, w, h) = plain_rect(&doc.root).unwrap();
         assert_eq!(color, [0xEE, 0x44, 0x55]);
         assert_eq!((x, y, w, h), (192, 96, 96, 48));
+    }
+
+    #[test]
+    fn two_stop_gradient_follows_the_office_curve() {
+        let mut rgb = vec![0u8; 720 * 3];
+        fill_gradient(
+            &mut rgb,
+            1,
+            720,
+            0,
+            0,
+            1,
+            720,
+            [0, 0, 0],
+            [255, 255, 255],
+            RIGHT_ANGLE,
+        );
+        let at = |y: usize| rgb[y * 3];
+        assert_eq!(at(180), 105);
+        assert_eq!(at(360), 186);
+        assert_eq!(at(540), 238);
+
+        let mut navy = vec![0u8; 720 * 3];
+        fill_gradient(
+            &mut navy,
+            1,
+            720,
+            0,
+            0,
+            1,
+            720,
+            [0x0B, 0x25, 0x45],
+            [0x1B, 0x6C, 0xA8],
+            RIGHT_ANGLE,
+        );
+        assert_eq!(&navy[360 * 3..360 * 3 + 3], &[21, 82, 130]);
+    }
+
+    #[test]
+    fn round_rect_stroke_covers_only_the_outer_pixel() {
+        let mut rgb = vec![0u8; 8 * 6 * 3];
+        let fill = RgbaFill {
+            color: [255, 255, 255],
+            alpha: 255,
+            on: true,
+        };
+        fill_round(&mut rgb, 8, 6, 1, 1, 6, 4, 7, 5, 0, 0, fill);
+        stroke_round(&mut rgb, 8, 6, 1, 1, 6, 4, 0, 1, 7, 5, [1, 2, 3]);
+        assert_eq!(&rgb[(8 + 1) * 3..][..3], &[1, 2, 3]);
+        assert_eq!(&rgb[(3 * 8 + 3) * 3..][..3], &[255, 255, 255]);
+
+        // 半径 3、线宽 1 时，实色直边从第 4 像素开始。拐角像素走圆弧。
+        let mut curved = vec![255u8; 16 * 24 * 3];
+        let white = RgbaFill {
+            color: [255, 255, 255],
+            alpha: 255,
+            on: true,
+        };
+        let inset = stroke_inset(3.0, 1.0);
+        assert_eq!(inset, 4);
+        paint_round_corners(
+            &mut curved,
+            16,
+            24,
+            1,
+            1,
+            15,
+            21,
+            inset,
+            3.0,
+            1.0,
+            white,
+            [1, 2, 3],
+        );
+        fill_round(&mut curved, 16, 24, 1, 1, 14, 20, 15, 21, 3, inset, white);
+        stroke_round(
+            &mut curved,
+            16,
+            24,
+            1,
+            1,
+            14,
+            20,
+            inset,
+            1,
+            15,
+            21,
+            [1, 2, 3],
+        );
+        let at = |buf: &[u8], x: usize, y: usize| {
+            let i = (y * 16 + x) * 3;
+            [buf[i], buf[i + 1], buf[i + 2]]
+        };
+        assert_eq!(at(&curved, 1, 1), [255, 255, 255]);
+        assert_eq!(at(&curved, 1, 5), [1, 2, 3]);
+        let arc = at(&curved, 4, 1);
+        assert!(arc[0] < 128, "圆弧没有描边 {arc:?}");
+    }
+
+    #[test]
+    fn drawingml_font_slot_splits_digits_from_han() {
+        assert!(matches!(font_slot('1', "zh-CN"), FontSlot::Latin));
+        assert!(matches!(font_slot(' ', "zh-CN"), FontSlot::Latin));
+        assert!(matches!(font_slot('万', "zh-CN"), FontSlot::Ea));
+        assert!(matches!(font_slot('\u{201C}', "zh-CN"), FontSlot::Ea));
+        assert!(matches!(font_slot('\u{201C}', "en-US"), FontSlot::Latin));
+        assert!(matches!(font_slot('ا', "ar-SA"), FontSlot::Cs));
+    }
+
+    #[test]
+    fn stroked_ellipse_uses_the_rounded_rect_plus_one_pixel() {
+        let oval = Oval {
+            x: 104.987,
+            y: 225.722,
+            w: 73.491,
+            h: 73.491,
+            fill: RgbaFill {
+                color: [46, 117, 182],
+                alpha: 255,
+                on: true,
+            },
+            stroke: Some([46, 117, 182]),
+            stroke_f: 1.333,
+        };
+        assert_eq!(ellipse_device_box(&oval, true), Some((105, 226, 74, 74)));
+        assert_eq!(ellipse_device_box(&oval, false), Some((105, 226, 73, 73)));
+        let carried = Oval { x: 388.451, ..oval };
+        assert_eq!(ellipse_device_box(&carried, true), Some((388, 226, 75, 74)));
+    }
+
+    #[test]
+    fn table_header_uses_minor_font_and_bold_white() {
+        let xml = r#"<a:p xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:r><a:t>季度</a:t></a:r></a:p>"#;
+        let doc = crate::xml::parse(xml.as_bytes()).unwrap();
+        let fonts = MinorFonts {
+            latin: "Calibri".to_string(),
+            ea: "微软雅黑".to_string(),
+        };
+        let line = cell_line(&doc.root, &fonts, true).unwrap();
+        assert_eq!(line.latin, "Calibri");
+        assert_eq!(line.ea, "微软雅黑");
+        assert!(line.bold);
+        assert_eq!(line.color, [255, 255, 255]);
+        assert!((line.px - 24.0).abs() < 0.01, "{}", line.px);
+        assert_eq!(line.align, "l");
+        let body = cell_line(&doc.root, &fonts, false).unwrap();
+        assert!(!body.bold);
+        assert_eq!(body.color, [0, 0, 0]);
+    }
+
+    #[test]
+    fn table_run_properties_override_the_header_style() {
+        let xml = r#"<a:p xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:r><a:rPr sz="1400" b="0"><a:solidFill><a:srgbClr val="FF0000"/></a:solidFill><a:latin typeface="Arial"/><a:ea typeface="宋体"/></a:rPr><a:t>A</a:t></a:r></a:p>"#;
+        let doc = crate::xml::parse(xml.as_bytes()).unwrap();
+        let fonts = MinorFonts {
+            latin: "Calibri".to_string(),
+            ea: "微软雅黑".to_string(),
+        };
+        let line = cell_line(&doc.root, &fonts, true).unwrap();
+        assert_eq!(line.latin, "Arial");
+        assert_eq!(line.ea, "宋体");
+        assert!(!line.bold);
+        assert_eq!(line.color, [255, 0, 0]);
+        assert!((line.px - 14.0 * 96.0 / 72.0).abs() < 0.01, "{}", line.px);
+    }
+
+    #[test]
+    fn medium_style_header_is_only_the_known_guid() {
+        let on = r#"<a:tbl xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:tblPr firstRow="1"><a:tableStyleId>{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}</a:tableStyleId></a:tblPr></a:tbl>"#;
+        let off = r#"<a:tbl xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:tblPr firstRow="0"><a:tableStyleId>{5C22544A-7EE6-4342-B048-85BDC9FD1C3A}</a:tableStyleId></a:tblPr></a:tbl>"#;
+        let other = r#"<a:tbl xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:tblPr firstRow="1"><a:tableStyleId>{00000000-0000-0000-0000-000000000000}</a:tableStyleId></a:tblPr></a:tbl>"#;
+        assert!(header_is_bold_light(
+            &crate::xml::parse(on.as_bytes()).unwrap().root
+        ));
+        assert!(!header_is_bold_light(
+            &crate::xml::parse(off.as_bytes()).unwrap().root
+        ));
+        assert!(!header_is_bold_light(
+            &crate::xml::parse(other.as_bytes()).unwrap().root
+        ));
+    }
+
+    #[test]
+    fn ellipse_edge_is_partial_not_a_step() {
+        let signed = ellipse_signed(10, 15, 10.5, 10.5, 5.0, 5.0);
+        assert!(signed.abs() < 1e-9, "{signed}");
+        let edge = ellipse_cover(10, 15, 10.5, 10.5, 5.0, 5.0);
+        assert!(edge > 0.4 && edge < 0.6, "{edge}");
+        assert_eq!(ellipse_cover(10, 10, 10.5, 10.5, 5.0, 5.0), 1.0);
+        assert_eq!(ellipse_cover(10, 20, 10.5, 10.5, 5.0, 5.0), 0.0);
     }
 }

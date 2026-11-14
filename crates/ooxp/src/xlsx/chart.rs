@@ -2092,6 +2092,7 @@ pub fn export_chart_image(bytes: &[u8], id: &str) -> Result<super::ExportedMedia
         height,
         accents,
         calibri_bytes().as_deref(),
+        super::chart_paint::ChartHost::Excel,
     )?;
     Ok(super::ExportedMedia {
         bytes: png,

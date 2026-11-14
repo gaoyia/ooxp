@@ -29,7 +29,8 @@ const LEGEND_PLOT_GAP: i32 = 22;
 const LEGEND_PAD: i32 = 4;
 /// 有标题时，图例在这 30 像素标题带之下垂直居中。无标题的图不加这截。
 const LEGEND_TITLE_BAND: i32 = 30;
-/// 标题墨迹比布局顶低 7 像素。绘图区仍从布局顶往下排。
+/// 标题墨迹比布局顶低 7 像素。Excel 的绘图区仍从布局顶往下排。
+/// PowerPoint 幻灯片把这 7 像素算进绘图区，网格才和导出的页对齐。
 const TITLE_DROP: f64 = 7.0;
 /// Excel 16.0 图表外框圆角。576、384、647 三档都是 14 像素。
 const CORNER_R: i32 = 14;
@@ -231,12 +232,21 @@ pub(crate) fn theme_accents(theme_xml: Option<&[u8]>) -> [[u8; 3]; 6] {
     accents
 }
 
+/// Excel 导出带圆角外框，绘图区从标题布局顶起算。
+/// 幻灯片导出没有这圈外框，有标题时绘图区再低一截。
+#[derive(Clone, Copy)]
+pub(crate) enum ChartHost {
+    Excel,
+    Slide,
+}
+
 pub(crate) fn render_chart(
     root: &Element,
     width: u32,
     height: u32,
     accents: [[u8; 3]; 6],
     font_bytes: Option<&[u8]>,
+    host: ChartHost,
 ) -> Result<Vec<u8>, Error> {
     if width == 0 || height == 0 || width > MAX_PX || height > MAX_PX {
         return Err(Error::with_path(ErrorKind::ChartImageUnsupported, "id"));
@@ -244,7 +254,7 @@ pub(crate) fn render_chart(
     let chart = read_clustered_column(root, accents)?;
     let font = font_bytes.and_then(|bytes| Font::from_bytes(bytes, FontSettings::default()).ok());
     let mut canvas = Canvas::new(width, height);
-    paint(&mut canvas, &chart, font.as_ref());
+    paint(&mut canvas, &chart, font.as_ref(), host);
     encode_png(width, height, &canvas.px)
 }
 
@@ -378,7 +388,7 @@ fn is_chart_wrapper(name: &str) -> bool {
     )
 }
 
-fn paint(canvas: &mut Canvas, chart: &ColumnChart, font: Option<&Font>) {
+fn paint(canvas: &mut Canvas, chart: &ColumnChart, font: Option<&Font>, host: ChartHost) {
     let label_px = (LABEL_PT * DPI / 72.0) as f32;
     let gdi = super::chart_gdi::Face::open(label_px, false);
     let title_face = chart
@@ -407,11 +417,21 @@ fn paint(canvas: &mut Canvas, chart: &ColumnChart, font: Option<&Font>) {
             .map(|face| face.line_height().ceil() as i32 / 2)
             .unwrap_or(0);
         // 标题占一行，下面再空一行，顶上的刻度才不压住标题。
-        title_top as i32 + 2 * (band + half)
+        let mut y = title_top as i32 + 2 * (band + half);
+        if matches!(host, ChartHost::Slide) {
+            y += TITLE_DROP as i32;
+        }
+        y
     } else {
         INSET_TOP
     };
-    let inset_right = legend_right_inset(chart, font, gdi.as_ref(), label_px);
+    let inset_right = legend_right_inset(
+        chart,
+        font,
+        gdi.as_ref(),
+        label_px,
+        matches!(host, ChartHost::Slide),
+    );
     let plot_r = canvas.w as i32 - inset_right;
     let plot_b = canvas.h as i32 - INSET_BOTTOM;
     let plot = Rect {
@@ -465,7 +485,9 @@ fn paint(canvas: &mut Canvas, chart: &ColumnChart, font: Option<&Font>) {
         );
     }
     draw_legend(canvas, chart, font, gdi.as_ref(), label_px, plot_r);
-    canvas.stroke_border(BORDER);
+    if matches!(host, ChartHost::Excel) {
+        canvas.stroke_border(BORDER);
+    }
 }
 
 fn draw_cat_ticks(canvas: &mut Canvas, n: usize, x0: f64, x1: f64, axis_y: i32) {
@@ -661,16 +683,32 @@ fn legend_right_inset(
     font: Option<&Font>,
     gdi: Option<&super::chart_gdi::Face>,
     px: f32,
+    slide: bool,
 ) -> i32 {
     if chart.legend != Some(LegendPos::Right) {
         return INSET_RIGHT;
     }
+    // 幻灯片上 PowerPoint 按 GDI+ 默认排版宽度把绘图区向左推。
+    // 字形前进宽度更窄，类目槽会被撑开，右边的柱跟着偏出去。
     let widest = chart
         .series
         .iter()
-        .map(|ser| text_width(font, gdi, &ser.name, px))
+        .map(|ser| {
+            if slide {
+                if let Some(face) = gdi {
+                    return face.layout_width(&ser.name);
+                }
+            }
+            text_width(font, gdi, &ser.name, px)
+        })
         .fold(0.0, f64::max);
-    let need = LEGEND_PLOT_GAP + LEGEND_SWATCH + LEGEND_GAP + widest.ceil() as i32 + LEGEND_PAD;
+    // 默认排版宽度已经含防裁切的边，再向上取整会把绘图区多让出 1 像素。
+    let name_px = if slide {
+        widest as i32
+    } else {
+        widest.ceil() as i32
+    };
+    let need = LEGEND_PLOT_GAP + LEGEND_SWATCH + LEGEND_GAP + name_px + LEGEND_PAD;
     need.max(INSET_RIGHT)
 }
 
@@ -1324,7 +1362,15 @@ mod tests {
     #[test]
     fn long_legend_label_stays_off_the_right_edge() {
         let doc = crate::xml::parse(LONG_LEGEND.as_bytes()).unwrap();
-        let png = render_chart(&doc.root, 576, 336, FALLBACK_ACCENTS, None).unwrap();
+        let png = render_chart(
+            &doc.root,
+            576,
+            336,
+            FALLBACK_ACCENTS,
+            None,
+            ChartHost::Excel,
+        )
+        .unwrap();
         let decoder = png::Decoder::new(std::io::Cursor::new(png));
         let mut reader = decoder.read_info().unwrap();
         let mut buf = vec![0; reader.output_buffer_size()];
@@ -1360,7 +1406,15 @@ mod tests {
     #[test]
     fn frame_is_rounded_and_category_ticks_drop() {
         let doc = crate::xml::parse(LONG_LEGEND.as_bytes()).unwrap();
-        let png = render_chart(&doc.root, 576, 336, FALLBACK_ACCENTS, None).unwrap();
+        let png = render_chart(
+            &doc.root,
+            576,
+            336,
+            FALLBACK_ACCENTS,
+            None,
+            ChartHost::Excel,
+        )
+        .unwrap();
         let decoder = png::Decoder::new(std::io::Cursor::new(png));
         let mut reader = decoder.read_info().unwrap();
         let mut buf = vec![0; reader.output_buffer_size()];
@@ -1398,6 +1452,102 @@ mod tests {
             assert!(ink(22, y), "数值轴次刻度没有向右 y={y}");
             assert!(!ink(17, y), "数值轴次刻度向左超过 2 像素 y={y}");
         }
+    }
+
+    const TITLED: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart">
+  <c:chart>
+    <c:title><c:tx><c:v>标题</c:v></c:tx></c:title>
+    <c:plotArea>
+      <c:barChart>
+        <c:barDir val="col"/>
+        <c:grouping val="clustered"/>
+        <c:ser>
+          <c:order val="0"/>
+          <c:tx><c:v>2025 年</c:v></c:tx>
+          <c:val><c:numLit><c:pt idx="0"><c:v>850</c:v></c:pt></c:numLit></c:val>
+        </c:ser>
+      </c:barChart>
+      <c:valAx><c:majorGridlines/></c:valAx>
+    </c:plotArea>
+  </c:chart>
+</c:chartSpace>"#;
+
+    #[test]
+    fn slide_host_drops_the_plot_and_skips_the_frame() {
+        let doc = crate::xml::parse(TITLED.as_bytes()).unwrap();
+        let excel = render_chart(
+            &doc.root,
+            576,
+            336,
+            FALLBACK_ACCENTS,
+            None,
+            ChartHost::Excel,
+        )
+        .unwrap();
+        let slide = render_chart(
+            &doc.root,
+            576,
+            336,
+            FALLBACK_ACCENTS,
+            None,
+            ChartHost::Slide,
+        )
+        .unwrap();
+        let decode = |png: Vec<u8>| {
+            let decoder = png::Decoder::new(std::io::Cursor::new(png));
+            let mut reader = decoder.read_info().unwrap();
+            let mut buf = vec![0; reader.output_buffer_size()];
+            let info = reader.next_frame(&mut buf).unwrap();
+            buf.truncate(info.buffer_size());
+            (info.width as i32, info.height as i32, buf)
+        };
+        let (w, h, excel_px) = decode(excel);
+        let (_, _, slide_px) = decode(slide);
+        let at = |bytes: &[u8], x: i32, y: i32| {
+            let i = (y as usize * w as usize + x as usize) * 3;
+            (bytes[i], bytes[i + 1], bytes[i + 2])
+        };
+        assert_eq!(at(&excel_px, 0, 20), (0x89, 0x89, 0x89));
+        assert_eq!(at(&slide_px, 0, 20), (255, 255, 255));
+        let first_grid = |bytes: &[u8]| {
+            (0..h)
+                .find(|y| at(bytes, 80, *y) == (0, 0, 0))
+                .expect("没有网格")
+        };
+        assert_eq!(
+            first_grid(&slide_px),
+            first_grid(&excel_px) + TITLE_DROP as i32
+        );
+    }
+
+    #[test]
+    fn slide_legend_keeps_the_category_span_from_growing() {
+        let doc = crate::xml::parse(LONG_LEGEND.as_bytes()).unwrap();
+        let render = |host| {
+            let png = render_chart(&doc.root, 576, 336, FALLBACK_ACCENTS, None, host).unwrap();
+            let decoder = png::Decoder::new(std::io::Cursor::new(png));
+            let mut reader = decoder.read_info().unwrap();
+            let mut buf = vec![0; reader.output_buffer_size()];
+            let info = reader.next_frame(&mut buf).unwrap();
+            buf.truncate(info.buffer_size());
+            (info.width as i32, buf)
+        };
+        let (w, excel) = render(ChartHost::Excel);
+        let (_, slide) = render(ChartHost::Slide);
+        let last_dark = |bytes: &[u8], y: i32| {
+            (0..w).rev().find(|x| {
+                let i = (y as usize * w as usize + *x as usize) * 3;
+                bytes[i] < 40 && bytes[i + 1] < 40 && bytes[i + 2] < 40
+            })
+        };
+        let y = 336 - INSET_BOTTOM;
+        let excel_r = last_dark(&excel, y).expect("excel 没有横轴");
+        let slide_r = last_dark(&slide, y).expect("slide 没有横轴");
+        assert!(
+            excel_r - slide_r >= 4,
+            "幻灯片绘图区右端应更靠左 excel={excel_r} slide={slide_r}"
+        );
     }
 
     fn one_series(max: f64) -> Series {
