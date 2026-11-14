@@ -97,6 +97,7 @@ fn needs_package(action: &str) -> bool {
             | "exportChartData"
             | "exportChartImage"
             | "exportSparklineImage"
+            | "exportSheetImage"
             | "exportSlideImage"
             | "exportPageImage"
             | "layoutCheck"
@@ -112,6 +113,7 @@ fn output_name(value: &Value) -> String {
         | "exportChartData"
         | "exportChartImage"
         | "exportSparklineImage"
+        | "exportSheetImage"
         | "exportSlideImage"
         | "exportPageImage" => pick("output"),
         _ => pick("path"),

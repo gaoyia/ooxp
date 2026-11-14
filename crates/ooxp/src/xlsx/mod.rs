@@ -42,6 +42,7 @@ mod print;
 mod protect;
 mod request;
 mod shape;
+mod sheet_paint;
 mod sheets;
 mod slicer;
 mod smartart;
@@ -64,6 +65,7 @@ pub use create::create_with_workbook_ct;
 pub use inspect::inspect;
 pub use picture::export_media;
 pub use request::{parse_ops, parse_scope};
+pub use sheet_paint::export_sheet_image;
 pub use sparkline::export_sparkline_image;
 
 pub(crate) use chart_gdi::{fill_device_ellipse, Face};

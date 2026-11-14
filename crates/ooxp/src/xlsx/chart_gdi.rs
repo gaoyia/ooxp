@@ -103,6 +103,7 @@ mod win {
         font: *mut c_void,
         name: String,
         bold: bool,
+        italic: bool,
         pt: f32,
     }
 
@@ -124,7 +125,7 @@ mod win {
         pub fn open(px: f32, bold: bool) -> Option<Self> {
             let pt = (f64::from(px) * 72.0 / 96.0) as f32;
             for name in FACES {
-                let Some(mut face) = Self::new(px, bold, name, pt) else {
+                let Some(mut face) = Self::new(px, bold, false, name, pt) else {
                     continue;
                 };
                 let actual = face.text_face();
@@ -140,7 +141,7 @@ mod win {
         pub fn open_named(px: f32, bold: bool, name: &str) -> Option<Self> {
             let pt = (f64::from(px) * 72.0 / 96.0) as f32;
             if !name.is_empty() && !name.starts_with('+') {
-                if let Some(mut face) = Self::new(px, bold, name, pt) {
+                if let Some(mut face) = Self::new(px, bold, false, name, pt) {
                     face.name = face.text_face();
                     if !face.name.is_empty() {
                         return Some(face);
@@ -150,8 +151,25 @@ mod win {
             Self::open(px, bold)
         }
 
+        /// 单元格文字。斜体只走这一条，图表字仍不加斜。
+        pub fn open_cell(px: f32, bold: bool, italic: bool, name: &str) -> Option<Self> {
+            let pt = (f64::from(px) * 72.0 / 96.0) as f32;
+            if !name.is_empty() && !name.starts_with('+') {
+                if let Some(mut face) = Self::new(px, bold, italic, name, pt) {
+                    face.name = face.text_face();
+                    if !face.name.is_empty() {
+                        return Some(face);
+                    }
+                }
+            }
+            Self::new(px, bold, italic, "Calibri", pt).map(|mut face| {
+                face.name = face.text_face();
+                face
+            })
+        }
+
         /// `px` 是 96 dpi 下的像素字号。负高度让 GDI 按字符高度而不是单元格高度来建。
-        fn new(px: f32, bold: bool, name: &str, pt: f32) -> Option<Self> {
+        fn new(px: f32, bold: bool, italic: bool, name: &str, pt: f32) -> Option<Self> {
             let height = -(px.round() as i32);
             if height == 0 {
                 return None;
@@ -169,7 +187,7 @@ mod win {
                     0,
                     0,
                     if bold { FW_BOLD } else { FW_NORMAL },
-                    0,
+                    u32::from(italic),
                     0,
                     0,
                     0,
@@ -189,6 +207,7 @@ mod win {
                     font,
                     name: name.to_string(),
                     bold,
+                    italic,
                     pt,
                 })
             }
@@ -252,7 +271,7 @@ mod win {
                     return None;
                 }
                 let mut font = std::ptr::null_mut();
-                let style = if self.bold { FONT_STYLE_BOLD } else { 0 };
+                let style = self.gdip_style();
                 if GdipCreateFont(family, self.pt, style, UNIT_POINT, &mut font) != 0
                     || font.is_null()
                 {
@@ -472,7 +491,7 @@ mod win {
                     return false;
                 }
                 let mut font = std::ptr::null_mut();
-                let style = if self.bold { FONT_STYLE_BOLD } else { 0 };
+                let style = self.gdip_style();
                 if GdipCreateFont(family, self.pt, style, UNIT_POINT, &mut font) != 0
                     || font.is_null()
                 {
@@ -581,6 +600,43 @@ mod win {
             (ok != 0 && metric.ascent > 0).then_some(metric)
         }
 
+        fn gdip_style(&self) -> i32 {
+            let mut style = 0;
+            if self.bold {
+                style |= FONT_STYLE_BOLD;
+            }
+            if self.italic {
+                style |= FONT_STYLE_ITALIC;
+            }
+            style
+        }
+
+        /// 单元格左缘留白。Excel 取平均字宽的一半，20 磅加粗微软雅黑是 7 像素。
+        pub fn cell_pad(&self) -> f64 {
+            self.text_metric()
+                .map(|m| f64::from(m.ave_char_width / 2).max(1.0))
+                .unwrap_or(2.0)
+        }
+
+        /// 按 GDI 前进宽度逐字画。整段 GDI+ 会把有的字压窄 1 像素，标题就会越排越偏。
+        /// 像素仍用 GDI+。GDI 灰阶能把汉字收进字框，但整表字形更灰，差会多出约六千像素。
+        pub fn draw_cells(
+            &self,
+            text: &str,
+            x: f64,
+            top: f64,
+            color: [u8; 3],
+            mut blend: impl FnMut(i32, i32, [u8; 3], u8),
+        ) {
+            let mut cursor = x;
+            for ch in text.chars() {
+                let advance = self.advance(ch);
+                let piece = ch.to_string();
+                self.draw(&piece, cursor, top, color, &mut blend);
+                cursor += advance;
+            }
+        }
+
         /// 基线到字顶的距离。画字时用它，避免汉字高出数字「0」的黑框。
         pub fn line_height(&self) -> f64 {
             self.text_metric()
@@ -600,6 +656,7 @@ mod win {
     const UNIT_PIXEL: i32 = 2;
     const UNIT_POINT: i32 = 3;
     const FONT_STYLE_BOLD: i32 = 1;
+    const FONT_STYLE_ITALIC: i32 = 2;
     const PIXEL_FORMAT_32BPP_ARGB: i32 = 0x0026_200A;
     /// GenericTypographic 再加不换行、保留行尾空格、不裁切。
     const STRING_FORMAT_TYPO: i32 = 0x7804;
@@ -897,6 +954,10 @@ impl Face {
         None
     }
 
+    pub fn open_cell(_: f32, _: bool, _: bool, _: &str) -> Option<Self> {
+        None
+    }
+
     pub fn line_height(&self) -> f64 {
         0.0
     }
@@ -913,7 +974,22 @@ impl Face {
         self.width(text)
     }
 
+    pub fn cell_pad(&self) -> f64 {
+        2.0
+    }
+
     pub fn draw(&self, _: &str, _: f64, _: f64, _: [u8; 3], _: impl FnMut(i32, i32, [u8; 3], u8)) {}
+
+    pub fn draw_cells(
+        &self,
+        text: &str,
+        x: f64,
+        top: f64,
+        color: [u8; 3],
+        blend: impl FnMut(i32, i32, [u8; 3], u8),
+    ) {
+        self.draw(text, x, top, color, blend);
+    }
 }
 
 #[cfg(not(windows))]

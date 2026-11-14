@@ -82,6 +82,7 @@ pub(super) fn render(kind: &ErrorKind) -> String {
             IdReason::SlideIndexFromOne => "slide 序号从 1 起".into(),
             IdReason::ExportSlideNeedsSlide => "出图 id 必须是 slide:N".into(),
             IdReason::ExportPageNeedsPage => "出图 id 必须是 page:N".into(),
+            IdReason::ExportSheetNeedsSheet => "出图 id 必须是 sheet:名称".into(),
             IdReason::ShapeEmpty => "shape 后面不能为空".into(),
             IdReason::ShapeIndexNotInt => "shape:index 后面必须是正整数".into(),
             IdReason::ShapeIndexFromOne => "shape:index 从 1 起".into(),
@@ -1263,6 +1264,9 @@ pub(super) fn render(kind: &ErrorKind) -> String {
         }
         ErrorKind::SparklineImageUnsupported => {
             "这条迷你图还不能画出 PNG。目前只画一组里的一条折线，不画标记、高低点、坐标轴和日期轴，而且格子宽高要落在 1 到 4096 像素之间".into()
+        }
+        ErrorKind::SheetImageUnsupported => {
+            "这张工作表还不能画出 PNG。目前按已用区域画网格、纯色填充、细中粗实线边框、文字、合并单元格、数据条、色阶和筛选按钮。画不了的对象会让整表失败，宽高也要落在 1 到 4096 像素之间".into()
         }
         ErrorKind::InvalidXlsxAnchor => "anchor 必须是 oneCell 或 twoCell".into(),
         ErrorKind::InvalidXlsxEditAs => "editAs 必须是 twoCell、oneCell 或 absolute".into(),

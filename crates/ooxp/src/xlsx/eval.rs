@@ -325,6 +325,37 @@ impl FormulaSession {
             Calc::Ready(_) | Calc::Skip => FormulaOutcome::Unknown,
         }
     }
+
+    /// 和 `eval` 同一条求值，但留下文字。工作表出图要画出 `IF` 的结果。
+    pub(crate) fn displayed(&mut self, formula: &str, here: CellRef) -> Displayed {
+        let body = formula.trim().trim_start_matches('=');
+        if body.is_empty() {
+            return Displayed::Empty;
+        }
+        let Some(expr) = parse_expr(body) else {
+            return Displayed::Bad;
+        };
+        let calc = match self.book.eval_expr(&expr, self.sheet, here, Mode::Scalar) {
+            Calc::Ready(v) => self.book.coerce(v, self.sheet, here, Mode::Scalar),
+            Calc::Skip => return Displayed::Bad,
+        };
+        match calc {
+            Calc::Ready(Value::Scalar(Scalar::Num(n))) if n.is_finite() => Displayed::Num(n),
+            Calc::Ready(Value::Scalar(Scalar::Bool(b))) => Displayed::Bool(b),
+            Calc::Ready(Value::Scalar(Scalar::Text(s))) => Displayed::Text(s),
+            _ => Displayed::Bad,
+        }
+    }
+}
+
+/// 公式在格子上的显示值。`Bad` 表示这格算不了。
+#[derive(Clone, Debug)]
+pub(crate) enum Displayed {
+    Num(f64),
+    Text(String),
+    Bool(bool),
+    Empty,
+    Bad,
 }
 
 pub(crate) fn fill_saved(bytes: Vec<u8>, base_dir: Option<&Path>) -> Result<Vec<u8>, Error> {

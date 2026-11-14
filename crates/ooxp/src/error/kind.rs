@@ -47,6 +47,8 @@ pub(crate) enum IdReason {
     ExportSlideNeedsSlide,
     /// exportPageImage 的 id 必须是 page:N
     ExportPageNeedsPage,
+    /// exportSheetImage 的 id 必须是 sheet:{name}
+    ExportSheetNeedsSheet,
     ShapeEmpty,
     ShapeIndexNotInt,
     ShapeIndexFromOne,
@@ -802,6 +804,7 @@ define_error_kinds! {
     PageNotFound { n: u32 } => vec![Self::PageNotFound { n: 2 }],
     PageImageUnsupported => vec![Self::PageImageUnsupported],
     SparklineImageUnsupported => vec![Self::SparklineImageUnsupported],
+    SheetImageUnsupported => vec![Self::SheetImageUnsupported],
     InvalidXlsxAnchor => vec![Self::InvalidXlsxAnchor],
     InvalidXlsxEditAs => vec![Self::InvalidXlsxEditAs],
     NotesSlideImage => vec![Self::NotesSlideImage],
@@ -1421,6 +1424,7 @@ impl IdReason {
             Self::SlideIndexFromOne,
             Self::ExportSlideNeedsSlide,
             Self::ExportPageNeedsPage,
+            Self::ExportSheetNeedsSheet,
             Self::ShapeEmpty,
             Self::ShapeIndexNotInt,
             Self::ShapeIndexFromOne,
@@ -2360,6 +2364,7 @@ impl ErrorKind {
             | Self::SlideImageUnsupported
             | Self::PageImageUnsupported
             | Self::SparklineImageUnsupported
+            | Self::SheetImageUnsupported
             | Self::TableHasRevision
             | Self::TableGridMismatch
             | Self::MergeNotSimple

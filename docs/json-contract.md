@@ -13,6 +13,7 @@ xlsx / docx / pptx 的稳定 id、inspect、create 与专用 apply 分别见 [js
 xlsx、docx、pptx 的 inspect、create、apply 已经按本文实现。docx 另有 `exportMedia` 与 `exportChartData`。
 xlsx 另有 `exportChartImage`：按图表 id 把簇状柱形图画成 PNG。像素不进 inspect。
 xlsx 另有 `exportSparklineImage`：按迷你图组 id 把一条折线画成 PNG。像素不进 inspect。
+xlsx 另有 `exportSheetImage`：按工作表 id 把已用区域画成 PNG。像素不进 inspect。画不了的对象让整表失败。
 pptx 另有 `exportSlideImage`：按幻灯片 id 把页底、PNG、矩形、圆角矩形、椭圆、两色渐变、形状文字、簇状柱形图和纯色单元格的表写成图。像素不进 inspect。画不了的对象让整页失败。
 docx 另有 `exportPageImage`：按页 id 把没有字的一页写成 PNG。像素不进 inspect。有字、表格和图还不画。
 docx 的 `exportMedia` 认图 id、OLE id、墨迹画布 id、3D 模型 id 与嵌入字体 id：图 id 写出 `/word/media/…`，OLE id 写出 embeddings 部件，
@@ -104,10 +105,10 @@ xlsx 也可用 `insertProtectedRange` / `setProtectedRange` / `deleteProtectedRa
 | 字段 | 类型 | 含义 |
 | --- | --- | --- |
 | `schemaVersion` | 整数 | 可选。省略视为 `1`。写了就必须是 `1` |
-| `action` | 字符串 | `inspect`、`create`、`apply`、`exportMedia`、`exportChartData`、`exportChartImage`、`exportSparklineImage`、`exportSlideImage`、`exportPageImage`、`layoutCheck`、`help` 之一 |
+| `action` | 字符串 | `inspect`、`create`、`apply`、`exportMedia`、`exportChartData`、`exportChartImage`、`exportSparklineImage`、`exportSheetImage`、`exportSlideImage`、`exportPageImage`、`layoutCheck`、`help` 之一 |
 | `locale` | 字符串 | 可选。错误 `message` 的语言偏好，见 [errors.md](errors.md) |
 
-`locale` 不属于动作参数，十一种动作都认。取值宽松匹配：`zh`、`zh-CN`、`zh-Hans`、`zh-SG` 出中文；`en` 及其地区变体出英文；不认识的标签（包括空串）退回英文，不报 `InvalidField`。
+`locale` 不属于动作参数，十二种动作都认。取值宽松匹配：`zh`、`zh-CN`、`zh-Hans`、`zh-SG` 出中文；`en` 及其地区变体出英文；不认识的标签（包括空串）退回英文，不报 `InvalidField`。
 这是信封里唯一一处对未知取值不报错的字段：语言只影响呈现，不该挡下文档操作。优先级是请求 `locale` 高于命令行 `--lang`，再高于环境变量 `OOXP_LANG`，都没有时是英文。`ooxp mcp --lang` 与这里的 `--lang` 同一档。没带时，错误文案只剩 `locale` 和 `OOXP_LANG`。`help` 在请求和 `--lang` 都没给语言时仍是中文。自己另写的外部 MCP 没有后两档，只能写请求里的 `locale`。
 
 另外按动作需要 `path`、`format`、`scope`、`workbook`、`document`、`presentation`、`ops`、`id`、`output` 等字段，见下文。
@@ -133,14 +134,14 @@ xlsx 也可用 `insertProtectedRange` / `setProtectedRange` / `deleteProtectedRa
 
 `help` 不读文件，也不改文件。用来查某个操作该怎么填，避免把别的格式的字段套过来。
 
-本工具不支持预览。xlsx 的簇状柱形图可以按 `exportChartImage` 写成 PNG。xlsx 的折线迷你图可以按 `exportSparklineImage` 写成 PNG。pptx 可以按 `exportSlideImage` 把页底、PNG、矩形、圆角矩形、椭圆、两色渐变、形状文字、簇状柱形图和纯色单元格的表写成图。画不了的对象让整页失败。docx 没有字的页可以按 `exportPageImage` 写成 PNG，有字的页还不画。像素不进 inspect。机器上有 Microsoft Office 或 WPS 时，可以自己导出后再查看：
+本工具不支持预览。xlsx 的簇状柱形图可以按 `exportChartImage` 写成 PNG。xlsx 的折线迷你图可以按 `exportSparklineImage` 写成 PNG。xlsx 的已用区域可以按 `exportSheetImage` 写成 PNG。pptx 可以按 `exportSlideImage` 把页底、PNG、矩形、圆角矩形、椭圆、两色渐变、形状文字、簇状柱形图和纯色单元格的表写成图。画不了的对象让整页失败。docx 没有字的页可以按 `exportPageImage` 写成 PNG，有字的页还不画。像素不进 inspect。机器上有 Microsoft Office 或 WPS 时，可以自己导出后再查看：
 
 - Word、Excel，以及 WPS 的 `kwps`、`ket`，用 `ExportAsFixedFormat` 写成 PDF
 - PowerPoint 和 WPS 的 `kwpp`，用幻灯片的 `Export` 写成 PNG
 
 本工具不调用它们。不写 `format`、`q`、`op`、`name` 时，这句话写在 `help` 这一条的 `limits` 里。搜「预览」或 `preview` 也会命中。
 
-不带 `format`、`q`、`op`、`name` 时，只说明十一个动作各自干什么，以及下一步该带哪些字段。
+不带 `format`、`q`、`op`、`name` 时，只说明十二个动作各自干什么，以及下一步该带哪些字段。
 
 带 `format` 时，列出该格式的操作。`description` 只写这个操作做什么。填的时候要注意的放在 `limits`，另成一条。`xlsm` 与 `xlsx` 同一份名单。
 
@@ -2415,6 +2416,50 @@ docx 的 3D 模型 id 写出 `/word/media/…` 的 GLB 原字节。嵌入图表�
 - 找不到组报 `IdNotFound`。id 不是迷你图组 id 报 `InvalidId`
 - 成功时 `contentType` 为 `image/png`。源包不写回
 - 折线的抗锯齿可以和 Excel 差几个像素。差多少记在手测里，不靠加大容差算通过
+
+## exportSheetImage
+
+按工作表 id 把已用区域画成 PNG，写到本地。只读。不改源包，不把像素放进 inspect。图里是格子，不是浮动图表。压到已用区域上的图形让整表失败。
+
+```json
+{
+  "schemaVersion": 1,
+  "action": "exportSheetImage",
+  "path": "C:\\data\\book.xlsx",
+  "id": "sheet:总览",
+  "output": "C:\\out\\sheet.png"
+}
+```
+
+| 字段 | 必填 | 含义 |
+| --- | --- | --- |
+| `path` | 是 | 源 xlsx 或 xlsm |
+| `id` | 是 | 工作表 id，与 inspect 的 `sheet:{name}` 相同 |
+| `output` | 是 | 本地目标路径。缺了报 `MissingField`。不得默认写成源 `path` |
+| `format` | 否 | 可省略，从 `path` 扩展名推断 |
+
+- 范围用 `dimension`。没有它时，用有格子的最小外框。外框是空的报 `NotImplemented`
+- 像素对齐 Excel 16.0 的 `Range.CopyPicture`（`xlScreen`、`xlBitmap`）。不乘工作表 `zoomScale`
+- 显式列宽按 `floor(((256 * 宽度 + floor(128 / 7)) / 256) * 7)`。没写列宽、也没写 `defaultColWidth` 时是 64 像素
+- 写了行高就截断：`floor(round(磅 * 12700) / 9525)`。20 磅是 26，不是 27
+- 没写行高时，Calibri 11 磅按 15 磅。微软雅黑、宋体、黑体、等线、楷体、仿宋按字号乘 1.65。其余按字号乘 15/11。一行里取最高的
+- 宽和高是各格像素之和再加 1。这一像素是外框
+- 网格色是 `E0E0E0`。纯色填充盖住格子右缘和下缘那条网格。右边和下边的格子后画，盖住交界。上边和左边的外框最后仍画成网格色
+- 文字认左、中、右和常规。常规时数字靠右，文字靠左，布尔居中。垂直认上、中、下。左缘留白是该字体平均字宽的一半，右缘留 2 像素。字与字的间距用 GDI 前进宽度，不跟整段字符串的排版步进
+- 数字格式认常规、`0`、`0.0`、`0.00`、`#,##0`，以及同样位数的百分数。带分号或方括号的格式报 `NotImplemented`
+- 公式没有缓存时用库里的求值，包括 `IF` 的文字。算不了报 `NotImplemented`
+- 合并单元格按锚点的样式铺满。合并区域跨出已用区域报 `NotImplemented`
+- 数据条只认最小、最大两档。长度从列内可用宽度的 10% 到 90%，并向白色淡出。负数报 `NotImplemented`
+- 色阶认两档或三档。百分位用 `PERCENTILE.INC`，颜色按 RGB 混合
+- `cellIs` 没有 `dxfId` 时不改像素。有纯色 `dxf` 填充时盖住格子
+- 自动筛选在表头右侧画 17×17 的按钮。箭头水平居中，尖端落在按钮正中。表头文字停在按钮左边
+- 实线边框认 `thin`、`medium`、`thick`，宽度是 1、2、3 像素。颜色用 `rgb`，没写颜色时用黑色。线以格子边界为中线，偶数宽度多出的一像素落在格外。线只伸到实际有边的那一端，不沿合并区扩开。落在合并区内部的边不画。同一条边界上更粗的线盖住更细的线，同样粗时右边和下边的格子后画。斜线、虚线、主题色和索引色报 `NotImplemented`
+- 关掉网格、从右到左、隐藏行列、渐变填充、主题色、压到区域上的图形、组合图形和其它条件格式，报 `NotImplemented`
+- 宽或高小于 1 或大于 4096 报 `NotImplemented`
+- docx 与 pptx 报 `InvalidField`
+- 找不到工作表报 `IdNotFound`。id 不是 `sheet:{name}` 报 `InvalidId`
+- 成功时 `contentType` 为 `image/png`。源包不写回
+- 字形灰度可以和 Excel 不同。差多少记在手测里，不靠加大容差算通过
 
 ## exportSlideImage
 

@@ -7,7 +7,7 @@
 
 产品名是 `ooxp`，全称 Office Open XML Patch。一个 Rust 库，外加一个命令行工具。库只认领域 JSON。命令行把 stdin 或文件里的领域 JSON 交给库，再把结果写到 stdout 或磁盘。
 
-命令行另有 `ooxp mcp`。它从标准输入读 JSON-RPC，把十一个动作登记成工具。十一个动作是 `inspect`、`create`、`apply`、`exportMedia`、`exportChartData`、`exportChartImage`、`exportSparklineImage`、`exportSlideImage`、`exportPageImage`、`layoutCheck`、`help`。
+命令行另有 `ooxp mcp`。它从标准输入读 JSON-RPC，把十二个动作登记成工具。十二个动作是 `inspect`、`create`、`apply`、`exportMedia`、`exportChartData`、`exportChartImage`、`exportSparklineImage`、`exportSheetImage`、`exportSlideImage`、`exportPageImage`、`layoutCheck`、`help`。
 参数有两种形状：直接写领域 JSON，或只写 `requestPath` 指向一份领域 JSON 文件。命令行读完文件后，交给库的仍是领域 JSON。库不解析这一层信封。
 
 不许为了信封去改领域 JSON。`requestPath` 不是领域字段。也不许把动作拆扁成一套 MCP 专用字段。
@@ -15,7 +15,7 @@
 对齐 Transitional OOXML，也就是 Office 默认存出来的那种包。
 ECMA-376 示例里常见的 Strict 命名空间（`http://purl.oclc.org/ooxml/...`）只作对照，create 不按 Strict 生成。
 根关系里 `officeDocument` 的类型，或主部件根元素的命名空间，以 `http://purl.oclc.org/ooxml/` 开头，就是 Strict 包。
-inspect、exportMedia、exportChartData、exportChartImage、exportSparklineImage、exportSlideImage、exportPageImage 只读，照常执行。
+inspect、exportMedia、exportChartData、exportChartImage、exportSparklineImage、exportSheetImage、exportSlideImage、exportPageImage 只读，照常执行。
 apply 在执行第一条 op 之前拒绝，报 `NotImplemented`，不写文件。
 请先用 Office 另存为 Transitional。本程序不实现 Strict 写入。
 
@@ -31,7 +31,7 @@ apply 在执行第一条 op 之前拒绝，报 `NotImplemented`，不写文件�
 
 禁止把 inspect 树当成完整文档模型，改完之后整包重新生成。apply 的入参只能是操作列表，不能是整棵树。
 
-本工具不支持预览。xlsx 的簇状柱形图可以按 `exportChartImage` 写成 PNG。xlsx 的折线迷你图可以按 `exportSparklineImage` 写成 PNG。pptx 可以按 `exportSlideImage` 把页底、PNG、矩形、圆角矩形、椭圆、两色渐变、形状文字、簇状柱形图和纯色单元格的表写成图。画不了的对象让整页失败。docx 没有字的页可以按 `exportPageImage` 写成 PNG，有字的页还不画。像素不进 inspect。库不调用 Office 或 WPS。机器上有其中之一时，调用方可以自己导出后再查看：
+本工具不支持预览。xlsx 的簇状柱形图可以按 `exportChartImage` 写成 PNG。xlsx 的折线迷你图可以按 `exportSparklineImage` 写成 PNG。xlsx 的已用区域可以按 `exportSheetImage` 写成 PNG。pptx 可以按 `exportSlideImage` 把页底、PNG、矩形、圆角矩形、椭圆、两色渐变、形状文字、簇状柱形图和纯色单元格的表写成图。画不了的对象让整页失败。docx 没有字的页可以按 `exportPageImage` 写成 PNG，有字的页还不画。像素不进 inspect。库不调用 Office 或 WPS。机器上有其中之一时，调用方可以自己导出后再查看：
 
 - Word、Excel，以及 WPS 的 `kwps`、`ket`，用 `ExportAsFixedFormat` 写成 PDF
 - PowerPoint 和 WPS 的 `kwpp`，用幻灯片的 `Export` 写成 PNG
@@ -46,6 +46,7 @@ docx 与 pptx 另有 `exportChartData`：按图表 id 把 embedding 工作簿原
 xlsx 对 `exportChartData` 仍报 `InvalidField`（图表数据就在本工作簿单元格里）。
 xlsx 另有 `exportChartImage`：按图表 id 把簇状柱形图画成 PNG。不改包，像素不进 inspect。docx 与 pptx 报 `InvalidField`。
 xlsx 另有 `exportSparklineImage`：按迷你图组 id 把一条折线画成 PNG。不改包，像素不进 inspect。docx 与 pptx 报 `InvalidField`。
+xlsx 另有 `exportSheetImage`：按工作表 id 把已用区域画成 PNG。不改包，像素不进 inspect。docx 与 pptx 报 `InvalidField`。
 pptx 另有 `exportSlideImage`：按幻灯片 id 把页底、PNG、矩形、圆角矩形、椭圆、两色渐变、形状文字、簇状柱形图和纯色单元格的表写成图。不改包，像素不进 inspect。xlsx 与 docx 报 `InvalidField`。
 docx 另有 `exportPageImage`：按页 id 把没有字的一页写成 PNG。不改包，像素不进 inspect。有字的页报 `NotImplemented`。xlsx 与 pptx 报 `InvalidField`。
 
@@ -579,6 +580,10 @@ docx `font:{n}` 按 fontTable 关系写出 odttf 原字节。包不写回。
 ### exportSparklineImage
 
 调用方给出源 xlsx、迷你图组 id 和本地目标路径。库打开包，用格子缓存和这个格子的宽高，把一条折线画成 PNG。包不写回。像素不进 inspect。不是这条折线则失败。docx 与 pptx 直接拒绝。
+
+### exportSheetImage
+
+调用方给出源 xlsx、工作表 id 和本地目标路径。库打开包，按 `dimension` 或单元格外框取范围，用 Excel 复制为图片的 100% 列宽和行高，把网格、纯色填充、细中粗实线边框、文字、合并单元格、数据条、色阶和筛选按钮画成 PNG。不乘工作表缩放。包不写回。像素不进 inspect。画不了的对象让整表失败。docx 与 pptx 直接拒绝。
 
 ### exportSlideImage
 
