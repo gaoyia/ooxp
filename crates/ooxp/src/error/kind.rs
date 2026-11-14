@@ -900,7 +900,7 @@ define_error_kinds! {
     SectionTypeOnLastPara => vec![Self::SectionTypeOnLastPara],
     CommentNotFound { id: String } => vec![Self::CommentNotFound { id: "comment:0".into() }],
     CommentBoxNotFound { id: String } => vec![Self::CommentBoxNotFound {
-        id: "cell:Sheet1!A1/comment:{00000000-0000-4000-8000-000000000001}".into(),
+        id: "cell:Sheet1!A1/comment:1".into(),
     }],
     CommentBoxMeasure { field: String } => vec![Self::CommentBoxMeasure { field: "width".into() }],
     NeedCommentParaId => vec![Self::NeedCommentParaId],

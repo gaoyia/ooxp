@@ -19344,8 +19344,8 @@
     "setCellOp": {
       "description": "改一个单元格的值或公式。",
       "descriptionEn": "Change a cell's value or formula.",
-      "limits": "value 和 formula 二选一，不能同时出现。arrayRef、sharedRef、dataTableRef 只能出现一个，shared 与 array 也不能同时为真。新建数据表要同时给 TABLE 公式和 dataTableRef。不改超链接，不改迷你图。不要把从属格当成主格来写。",
-      "limitsEn": "Give exactly one of value and formula; they cannot both appear. At most one of arrayRef, sharedRef, and dataTableRef may appear, and shared and array cannot both be true. A new data table needs both a TABLE formula and dataTableRef. Do not change hyperlinks or sparklines. Do not write a dependent cell as if it were the master cell.",
+      "limits": "value 和 formula 二选一，不能同时出现。arrayRef、sharedRef、dataTableRef 只能出现一个，shared 与 array 也不能同时为真。新建数据表要同时给 TABLE 公式和 dataTableRef。不改超链接，不改迷你图。不要把共享公式的从属格当成主格来写。",
+      "limitsEn": "Give exactly one of value and formula; they cannot both appear. At most one of arrayRef, sharedRef, and dataTableRef may appear, and shared and array cannot both be true. A new data table needs both a TABLE formula and dataTableRef. Do not change hyperlinks or sparklines. Do not write a shared formula's dependent cell as if it were the master cell.",
       "type": "object",
       "required": [
         "op",
