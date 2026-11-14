@@ -96,44 +96,69 @@ fn truthy(value: Option<&str>) -> bool {
 }
 
 fn used_range(sheet: &Element) -> Result<(u32, u32, u32, u32), Error> {
-    if let Some(dim) = sheet
+    // dimension 经常比格子小。两边都在时取并集，避免只画左上角，也避免画到界外时越界。
+    let dim = dimension_box(sheet)?;
+    let cells = cell_bounds(sheet)?;
+    match (dim, cells) {
+        (Some(dim), Some(cells)) => Ok(union_box(dim, cells)),
+        (Some(only), None) | (None, Some(only)) => Ok(only),
+        (None, None) => Err(unsupported()),
+    }
+}
+
+fn dimension_box(sheet: &Element) -> Result<Option<(u32, u32, u32, u32)>, Error> {
+    let Some(dim) = sheet
         .child_by_local("dimension")
         .and_then(|el| el.attr("ref"))
-    {
-        let (a, b) = a1::parse_range(dim).map_err(|_| unsupported())?;
-        return Ok((
-            a.col.min(b.col),
-            a.row.min(b.row),
-            a.col.max(b.col),
-            a.row.max(b.row),
-        ));
-    }
+        .filter(|dim| !dim.is_empty())
+    else {
+        return Ok(None);
+    };
+    let (a, b) = a1::parse_range(dim).map_err(|_| unsupported())?;
+    Ok(Some(box_of(a, b)))
+}
+
+fn cell_bounds(sheet: &Element) -> Result<Option<(u32, u32, u32, u32)>, Error> {
+    let Some(data) = sheet.child_by_local("sheetData") else {
+        return Ok(None);
+    };
     let mut c0 = u32::MAX;
     let mut r0 = u32::MAX;
     let mut c1 = 0u32;
     let mut r1 = 0u32;
     let mut any = false;
-    if let Some(data) = sheet.child_by_local("sheetData") {
-        let mut prev_row = 0u32;
-        for row in data.children_by_local("row") {
-            let r = a1::row_after(prev_row, row.attr("r"));
-            prev_row = r;
-            let mut prev_col = 0u32;
-            for cell in row.children_by_local("c") {
-                let (col, row_n) = cell_addr(prev_col, r, cell.attr("r"))?;
-                prev_col = col;
-                any = true;
-                c0 = c0.min(col);
-                r0 = r0.min(row_n);
-                c1 = c1.max(col);
-                r1 = r1.max(row_n);
-            }
+    let mut prev_row = 0u32;
+    for row in data.children_by_local("row") {
+        let r = a1::row_after(prev_row, row.attr("r"));
+        prev_row = r;
+        let mut prev_col = 0u32;
+        for cell in row.children_by_local("c") {
+            let (col, row_n) = cell_addr(prev_col, r, cell.attr("r"))?;
+            prev_col = col;
+            any = true;
+            c0 = c0.min(col);
+            r0 = r0.min(row_n);
+            c1 = c1.max(col);
+            r1 = r1.max(row_n);
         }
     }
     if !any {
-        return Err(unsupported());
+        return Ok(None);
     }
-    Ok((c0, r0, c1, r1))
+    Ok(Some((c0, r0, c1, r1)))
+}
+
+fn box_of(a: CellRef, b: CellRef) -> (u32, u32, u32, u32) {
+    (
+        a.col.min(b.col),
+        a.row.min(b.row),
+        a.col.max(b.col),
+        a.row.max(b.row),
+    )
+}
+
+fn union_box(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> (u32, u32, u32, u32) {
+    (a.0.min(b.0), a.1.min(b.1), a.2.max(b.2), a.3.max(b.3))
 }
 
 fn cell_addr(prev_col: u32, row: u32, attr: Option<&str>) -> Result<(u32, u32), Error> {
@@ -278,7 +303,182 @@ fn load_styles(pkg: &Package, wb_part: &str, rels: &Relationships) -> Result<Sty
     let part = crate::opc::resolve_rel_target(wb_part, &rel.target)?;
     let bytes = pkg.get(&part).map_err(|_| unsupported())?;
     let doc = crate::xml::parse(bytes)?;
-    Styles::parse(&doc.root)
+    let palette = Palette {
+        theme: theme_slots(pkg, wb_part, rels),
+        indexed: indexed_palette(&doc.root),
+    };
+    Styles::parse(&doc.root, &palette)
+}
+
+/// 工作表 `color/@theme` 的下标。0 是 `lt1`，1 是 `dk1`。默认正文字色写的就是 1。
+const THEME_NAMES: [&str; 12] = [
+    "lt1", "dk1", "lt2", "dk2", "accent1", "accent2", "accent3", "accent4", "accent5", "accent6",
+    "hlink", "folHlink",
+];
+
+struct Palette {
+    theme: [[u8; 3]; 12],
+    indexed: Vec<[u8; 3]>,
+}
+
+fn theme_slots(pkg: &Package, wb_part: &str, rels: &Relationships) -> [[u8; 3]; 12] {
+    let mut slots = default_theme();
+    let Some(rel) = rels
+        .rels
+        .iter()
+        .find(|rel| rel.rel_type.ends_with("/theme") && !rel.is_external())
+    else {
+        return slots;
+    };
+    let Ok(part) = crate::opc::resolve_rel_target(wb_part, &rel.target) else {
+        return slots;
+    };
+    let Ok(bytes) = pkg.get(&part) else {
+        return slots;
+    };
+    let Ok(doc) = crate::xml::parse(bytes) else {
+        return slots;
+    };
+    let Some(scheme) = find_local(&doc.root, "clrScheme") else {
+        return slots;
+    };
+    for (i, name) in THEME_NAMES.iter().enumerate() {
+        if let Some(rgb) = scheme.child_by_local(name).and_then(slot_rgb) {
+            slots[i] = rgb;
+        }
+    }
+    slots
+}
+
+fn default_theme() -> [[u8; 3]; 12] {
+    [
+        [255, 255, 255],
+        [0, 0, 0],
+        [0xEE, 0xEC, 0xE1],
+        [0x1F, 0x49, 0x7D],
+        [0x4F, 0x81, 0xBD],
+        [0xC0, 0x50, 0x4D],
+        [0x9B, 0xBB, 0x59],
+        [0x80, 0x64, 0xA2],
+        [0x4B, 0xAC, 0xC6],
+        [0xF7, 0x96, 0x46],
+        [0x00, 0x00, 0xFF],
+        [0x80, 0x00, 0x80],
+    ]
+}
+
+fn find_local<'a>(el: &'a Element, name: &str) -> Option<&'a Element> {
+    if el.local_name() == name {
+        return Some(el);
+    }
+    for child in el.element_children() {
+        if let Some(found) = find_local(child, name) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn slot_rgb(slot: &Element) -> Option<[u8; 3]> {
+    if let Some(el) = slot.child_by_local("srgbClr") {
+        return el.attr("val").and_then(parse_rgb);
+    }
+    let el = slot.child_by_local("sysClr")?;
+    el.attr("lastClr")
+        .and_then(parse_rgb)
+        .or_else(|| match el.attr("val") {
+            Some("window") => Some([255, 255, 255]),
+            Some("windowText") => Some([0, 0, 0]),
+            _ => None,
+        })
+}
+
+fn indexed_palette(root: &Element) -> Vec<[u8; 3]> {
+    let mut colors: Vec<[u8; 3]> = DEFAULT_INDEXED.iter().copied().map(rgb_of).collect();
+    let Some(list) = root
+        .child_by_local("colors")
+        .and_then(|el| el.child_by_local("indexedColors"))
+    else {
+        return colors;
+    };
+    for (i, el) in list.children_by_local("rgbColor").into_iter().enumerate() {
+        let Some(rgb) = el.attr("rgb").and_then(parse_rgb) else {
+            continue;
+        };
+        if i < colors.len() {
+            colors[i] = rgb;
+        } else {
+            colors.push(rgb);
+        }
+    }
+    colors
+}
+
+fn rgb_of(n: u32) -> [u8; 3] {
+    [
+        ((n >> 16) & 0xff) as u8,
+        ((n >> 8) & 0xff) as u8,
+        (n & 0xff) as u8,
+    ]
+}
+
+/// ECMA-376 默认索引色，从 0 起。64 是窗口文字，65 是窗口底。
+const DEFAULT_INDEXED: [u32; 64] = [
+    0x000000, 0xFFFFFF, 0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0xFF00FF, 0x00FFFF, 0x000000,
+    0xFFFFFF, 0xFF0000, 0x00FF00, 0x0000FF, 0xFFFF00, 0xFF00FF, 0x00FFFF, 0x800000, 0x008000,
+    0x000080, 0x808000, 0x800080, 0x008080, 0xC0C0C0, 0x808080, 0x9999FF, 0x993366, 0xFFFFCC,
+    0xCCFFFF, 0x660066, 0xFF8080, 0x0066CC, 0xCCCCFF, 0x000080, 0xFF00FF, 0xFFFF00, 0x00FFFF,
+    0x800080, 0x800000, 0x008080, 0x0000FF, 0x00CCFF, 0xCCFFFF, 0xCCFFCC, 0xFFFF99, 0x99CCFF,
+    0xFF99CC, 0xCC99FF, 0xFFCC99, 0x3366FF, 0x33CCCC, 0x99CC00, 0xFFCC00, 0xFF9900, 0xFF6600,
+    0x666699, 0x969696, 0x003366, 0x339966, 0x003300, 0x333300, 0x993300, 0x993366, 0x333399,
+    0x333333,
+];
+
+impl Palette {
+    fn resolve(&self, el: &Element) -> Option<[u8; 3]> {
+        let base = if let Some(rgb) = el.attr("rgb").and_then(parse_rgb) {
+            rgb
+        } else if let Some(index) = el.attr("theme").and_then(|s| s.parse::<usize>().ok()) {
+            *self.theme.get(index)?
+        } else if let Some(index) = el.attr("indexed").and_then(|s| s.parse::<usize>().ok()) {
+            self.indexed_at(index)?
+        } else if truthy(el.attr("auto")) {
+            [0, 0, 0]
+        } else {
+            return None;
+        };
+        let Some(tint) = el.attr("tint").and_then(|s| s.parse::<f64>().ok()) else {
+            return Some(base);
+        };
+        Some(apply_sheet_tint(base, tint))
+    }
+
+    fn indexed_at(&self, index: usize) -> Option<[u8; 3]> {
+        if let Some(rgb) = self.indexed.get(index) {
+            return Some(*rgb);
+        }
+        match index {
+            64 => Some([0, 0, 0]),
+            65 => Some([255, 255, 255]),
+            _ => None,
+        }
+    }
+}
+
+/// `tint` 按 ECMA-376 §18.8.3：负值把通道乘 `(1 + tint)`，正值向白靠拢。
+fn apply_sheet_tint(rgb: [u8; 3], tint: f64) -> [u8; 3] {
+    if tint.abs() < 1e-9 {
+        return rgb;
+    }
+    rgb.map(|channel| {
+        let v = f64::from(channel) / 255.0;
+        let out = if tint < 0.0 {
+            v * (1.0 + tint)
+        } else {
+            v * (1.0 - tint) + tint
+        };
+        (out * 255.0).round().clamp(0.0, 255.0) as u8
+    })
 }
 
 impl Styles {
@@ -305,7 +505,7 @@ impl Styles {
         }
     }
 
-    fn parse(root: &Element) -> Result<Self, Error> {
+    fn parse(root: &Element, palette: &Palette) -> Result<Self, Error> {
         let mut formats = HashMap::new();
         if let Some(list) = root.child_by_local("numFmts") {
             for item in list.children_by_local("numFmt") {
@@ -320,7 +520,7 @@ impl Styles {
         let mut fonts = Vec::new();
         if let Some(list) = root.child_by_local("fonts") {
             for font in list.children_by_local("font") {
-                fonts.push(read_font(font));
+                fonts.push(read_font(font, palette));
             }
         }
         if fonts.is_empty() {
@@ -335,13 +535,13 @@ impl Styles {
         let mut fills = Vec::new();
         if let Some(list) = root.child_by_local("fills") {
             for fill in list.children_by_local("fill") {
-                fills.push(read_fill(fill));
+                fills.push(read_fill(fill, palette));
             }
         }
         let mut borders = Vec::new();
         if let Some(list) = root.child_by_local("borders") {
             for border in list.children_by_local("border") {
-                borders.push(parse_edges(border)?);
+                borders.push(parse_edges(border, palette)?);
             }
         }
         let mut xfs = Vec::new();
@@ -363,7 +563,7 @@ impl Styles {
         let mut dxfs = Vec::new();
         if let Some(list) = root.child_by_local("dxfs") {
             for dxf in list.children_by_local("dxf") {
-                dxfs.push(read_dxf(dxf)?);
+                dxfs.push(read_dxf(dxf, palette)?);
             }
         }
         Ok(Self {
@@ -396,7 +596,7 @@ impl Styles {
     }
 }
 
-fn read_font(font: &Element) -> FontInfo {
+fn read_font(font: &Element, palette: &Palette) -> FontInfo {
     let name = font
         .child_by_local("name")
         .and_then(|el| el.attr("val"))
@@ -409,7 +609,7 @@ fn read_font(font: &Element) -> FontInfo {
         .unwrap_or(11.0);
     let color = match font.child_by_local("color") {
         None => Some([0, 0, 0]),
-        Some(el) => el.attr("rgb").and_then(parse_rgb),
+        Some(el) => palette.resolve(el),
     };
     FontInfo {
         name,
@@ -429,7 +629,7 @@ fn child_on(el: &Element, name: &str) -> bool {
     }
 }
 
-fn read_fill(fill: &Element) -> Fill {
+fn read_fill(fill: &Element, palette: &Palette) -> Fill {
     if fill.child_by_local("gradientFill").is_some() {
         return Fill::Nope;
     }
@@ -440,15 +640,14 @@ fn read_fill(fill: &Element) -> Fill {
         "none" => Fill::None,
         "solid" => pat
             .child_by_local("fgColor")
-            .and_then(|el| el.attr("rgb"))
-            .and_then(parse_rgb)
+            .and_then(|el| palette.resolve(el))
             .map(Fill::Solid)
             .unwrap_or(Fill::Nope),
         _ => Fill::Nope,
     }
 }
 
-fn parse_edges(border: &Element) -> Result<Edges, Error> {
+fn parse_edges(border: &Element, palette: &Palette) -> Result<Edges, Error> {
     if truthy(border.attr("diagonalUp")) || truthy(border.attr("diagonalDown")) {
         return Err(unsupported());
     }
@@ -458,14 +657,14 @@ fn parse_edges(border: &Element) -> Result<Edges, Error> {
         }
     }
     Ok(Edges {
-        left: parse_edge(border, "left")?,
-        right: parse_edge(border, "right")?,
-        top: parse_edge(border, "top")?,
-        bottom: parse_edge(border, "bottom")?,
+        left: parse_edge(border, "left", palette)?,
+        right: parse_edge(border, "right", palette)?,
+        top: parse_edge(border, "top", palette)?,
+        bottom: parse_edge(border, "bottom", palette)?,
     })
 }
 
-fn parse_edge(border: &Element, name: &str) -> Result<Option<Edge>, Error> {
+fn parse_edge(border: &Element, name: &str, palette: &Palette) -> Result<Option<Edge>, Error> {
     let Some(el) = border.child_by_local(name) else {
         return Ok(None);
     };
@@ -483,15 +682,7 @@ fn parse_edge(border: &Element, name: &str) -> Result<Option<Edge>, Error> {
     };
     let color = match el.child_by_local("color") {
         None => [0, 0, 0],
-        Some(color) => {
-            if color.attr("theme").is_some() || color.attr("indexed").is_some() {
-                return Err(unsupported());
-            }
-            color
-                .attr("rgb")
-                .and_then(parse_rgb)
-                .ok_or_else(unsupported)?
-        }
+        Some(color) => palette.resolve(color).ok_or_else(unsupported)?,
     };
     Ok(Some(Edge { px, color }))
 }
@@ -555,10 +746,10 @@ fn read_v(value: Option<&str>) -> Result<VAlign, Error> {
     }
 }
 
-fn read_dxf(dxf: &Element) -> Result<Dxf, Error> {
+fn read_dxf(dxf: &Element, palette: &Palette) -> Result<Dxf, Error> {
     let fill = match dxf.child_by_local("fill") {
         None => None,
-        Some(fill) => match read_fill(fill) {
+        Some(fill) => match read_fill(fill, palette) {
             Fill::None => None,
             Fill::Solid(rgb) => Some(rgb),
             Fill::Nope => return Err(unsupported()),
@@ -567,8 +758,7 @@ fn read_dxf(dxf: &Element) -> Result<Dxf, Error> {
     let color = dxf
         .child_by_local("font")
         .and_then(|font| font.child_by_local("color"))
-        .and_then(|el| el.attr("rgb"))
-        .and_then(parse_rgb);
+        .and_then(|el| palette.resolve(el));
     if dxf.child_by_local("border").is_some() {
         return Err(unsupported());
     }
@@ -591,6 +781,9 @@ fn parse_format(code: &str) -> Result<NumFmt, Error> {
     let code = code.trim();
     if code.contains(';') || code.contains('[') {
         return Err(unsupported());
+    }
+    if code.eq_ignore_ascii_case("general") {
+        return Ok(NumFmt::General);
     }
     if code == "#,##0" {
         return Ok(NumFmt::IntComma);
@@ -681,8 +874,12 @@ fn shown_of(
     here: CellRef,
     session: &mut Option<FormulaSession>,
 ) -> Result<Shown, Error> {
-    if let Some(formula) = cell.child_by_local("f") {
-        let text = formula.text_content();
+    // 有 `<v>` 或内联结果就用缓存。共享公式的从属格公式文本是空的，值在缓存里。
+    if cell.child_by_local("f").is_some() && !has_cached_value(cell) {
+        let text = cell
+            .child_by_local("f")
+            .map(|el| el.text_content())
+            .unwrap_or_default();
         if text.trim().is_empty() {
             return Err(unsupported());
         }
@@ -697,6 +894,14 @@ fn shown_of(
             Displayed::Bad => Err(unsupported()),
         };
     }
+    value_shown(cell, sst)
+}
+
+fn has_cached_value(cell: &Element) -> bool {
+    cell.child_by_local("v").is_some() || cell.child_by_local("is").is_some()
+}
+
+fn value_shown(cell: &Element, sst: &[String]) -> Result<Shown, Error> {
     let kind = cell.attr("t").unwrap_or("n");
     let value = cell
         .child_by_local("v")
@@ -1711,7 +1916,12 @@ fn paint_labels(
     for merge in merges {
         jobs.push((merge.c0, merge.r0, merge.c1, merge.r1));
     }
+    let c1 = c0 + xs.origin.len() as u32 - 2;
+    let r1 = r0 + ys.origin.len() as u32 - 2;
     for (col, row) in cells.keys() {
+        if *col < c0 || *row < r0 || *col > c1 || *row > r1 {
+            continue;
+        }
         if covered.contains(&(*col, *row)) {
             continue;
         }
@@ -1996,5 +2206,34 @@ mod tests {
         assert_eq!(excel_row_px(22.0), 29);
         assert_eq!(excel_row_px(32.0), 42);
         assert_eq!(excel_row_px(26.0), 34);
+    }
+
+    #[test]
+    fn theme_one_is_black_and_tint_moves_toward_white() {
+        let slots = default_theme();
+        assert_eq!(slots[0], [255, 255, 255]);
+        assert_eq!(slots[1], [0, 0, 0]);
+        assert_eq!(apply_sheet_tint([0, 0, 0], 0.5), [128, 128, 128]);
+        assert_eq!(apply_sheet_tint([255, 255, 255], -0.5), [128, 128, 128]);
+        let palette = Palette {
+            theme: slots,
+            indexed: DEFAULT_INDEXED.iter().copied().map(rgb_of).collect(),
+        };
+        assert_eq!(palette.indexed_at(2), Some([255, 0, 0]));
+        assert_eq!(palette.indexed_at(64), Some([0, 0, 0]));
+        assert_eq!(palette.indexed_at(80), None);
+    }
+
+    #[test]
+    fn short_dimension_still_covers_later_cells() {
+        let xml = br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1"/><sheetData><row r="1"><c r="A1"/><c r="C2"><v>1</v></c></row></sheetData></worksheet>"#;
+        let doc = crate::xml::parse(xml).unwrap();
+        assert_eq!(used_range(&doc.root).unwrap(), (1, 1, 3, 2));
+    }
+
+    #[test]
+    fn general_format_code_ignores_case() {
+        assert!(matches!(parse_format("GENERAL").unwrap(), NumFmt::General));
+        assert!(matches!(parse_format("General").unwrap(), NumFmt::General));
     }
 }
